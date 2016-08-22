@@ -1,3 +1,4 @@
+
 /*	
 
 	EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
@@ -13,6 +14,7 @@
 				  Important features:
 					  - Road plane segmentation based on RANSAC (pcl plane fitting used) and hence obstacle segmentation  
 					  - genrates possible driveable directions for the vehicle based on available gap
+					  - generates grid map (not probabilistic)
 				  
 				  Subscribes To:
 				  	  - /(namespace)/left/camera_info
@@ -25,10 +27,17 @@
 				  	  - ~/obstacle_points
 				  	  - ~/grid_view 
 				  	  - ~/incomming_point_cloud (if coloring set...it is colored based on segmentation)
-				  	  - ~/direction	(markers for drive direction)
-				  	  - ~/gap_markers (gaps are drawn as lines in green color)		
+				  	  - ~/drive_directions	(markers for drive direction)
+				  	  - ~/gap_marks (gaps are drawn as lines in green color)		
+				  	  - ~/direction_as_poses (drive directions as PoseArray msg - position - gapcenterpos, orientation - direction)
+				  	  
 				  	  
 	Note - More info on parameters to be here soon....				  								  
+	
+	ToDo - publish a range of directions for ever gap so that the PLANNER node can decide upon which is most suitable
+	
+	kind of a problem - not a problem but sometimes I find that this node does not get the subscribed messages... dont know why...
+	
 */
 
 #include <ros/ros.h>
@@ -59,7 +68,8 @@
 
 #include <image_geometry/stereo_camera_model.h>
 
-
+#include <geometry_msgs/PoseArray.h>
+#include <tf/transform_datatypes.h>
 
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
@@ -73,9 +83,10 @@ using namespace std;
 using namespace sensor_msgs;
 using namespace stereo_msgs;
 using namespace message_filters;
+using namespace geometry_msgs;
+
 
 long int pub_counter = 0;
-
 
 ros::Subscriber sub;
 ros::Subscriber imageSub_l;
@@ -88,7 +99,7 @@ ros::Publisher pub_grid_view;			//		      grid view with possible drive directio
 ros::Publisher pubDriveDirectionGlobal;	//			  possible drive directions as marker array in global frame
 ros::Publisher pub_obstacle_points;
 ros::Publisher pubGapMarkersGlobal;		// publish gap markers
-
+ros::Publisher pubDriveDirectionAsPoses;
 bool useDisparity = true;
 
 ros::NodeHandle *n;
@@ -119,7 +130,7 @@ class ExploreDirectionEstimator{
 			// make sure it is even in number
 			numOfAngularOccupancyBins = 180/angularOccupancyResolution;	
 			angularOccupancy.assign(numOfAngularOccupancyBins, 0);
-			angularOccupancyRho.assign(numOfAngularOccupancyBins, 99999);					
+			angularOccupancyRho.assign(numOfAngularOccupancyBins, angularOccupancyMaxRho);					
 			
 			//init plane parameters...four parameters
 			roadPlaneParameters[0] = roadPlaneParameters[1] = roadPlaneParameters[2] = roadPlaneParameters[3] = 0;			
@@ -142,6 +153,7 @@ class ExploreDirectionEstimator{
 			nh->setParam("grid_size", size);
 			makeGrid();
 		}					
+		
 		
 		// sets up the shared pointer to the input cloud
 		inline void setPointCloud(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud){
@@ -223,7 +235,15 @@ class ExploreDirectionEstimator{
 			nh->setParam("angular_occupancy_resolution", res);
 			angularOccupancyResolution = res;
 		}
+
+		inline float getGroundTolerance(){
+			return groundTolerance;
+		}
 		
+		
+		inline float getObstacleTolerance(){
+			return obstacleTolerance;
+		}
 		
 		// updates the passed allDriveDir (as reference) vector with all possible drive directions
 		// this interface does every thing, process pnt cld, get occupancies, and compute drive directions and gap locations
@@ -272,7 +292,7 @@ class ExploreDirectionEstimator{
 						
 						// perpendicular direction the gap opening
 						
-						
+						cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
 						possibleDriveDirections.push_back(thetaGapCenter);
 						possibleDriveGapLocations.push_back(gapCenter);
 						possibleGapEndPoints.push_back(cv::Vec4f(x1,y1, x2,y2));
@@ -331,7 +351,7 @@ class ExploreDirectionEstimator{
 						if(thetaGapCenter < 0){						
 							thetaGapCenter += 180;
 						}
-						//cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
+						cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
 					
 						possibleDriveDirections.push_back(thetaGapCenter);
 						possibleDriveGapLocations.push_back(gapCenter);
@@ -358,22 +378,22 @@ class ExploreDirectionEstimator{
 				for(int j = 0; j<sizeOfGrid; ++j){	//x
 							
 					if(grid.at<uchar>(i,j) == 1){
-						pt.x = j-centerOfGridInX;
+						pt.x = (j-centerOfGridInX)*0.1;
 						pt.y = 0;
-						pt.z = i-centerOfGridInZ;
+						pt.z = (i-centerOfGridInZ)*0.1;
 						pt.b = 0;
 						pt.r = 250;
 						pt.g = 50;							
-						cloud->push_back(pt);			        	
+						cloud->push_back(pt);	//scale it	        	
 					}
 					if(grid.at<uchar>(i,j) == 0 && !onlyObstacle){
-						pt.x = j-centerOfGridInX;
+						pt.x = (j-centerOfGridInX)*0.1;
 						pt.y = 0;
-						pt.z = i-centerOfGridInZ;
+						pt.z = (i-centerOfGridInZ)*0.1;
 						pt.b = 0;
 						pt.r = 0;
 						pt.g = 90;							
-						cloud->push_back(pt);
+						cloud->push_back(pt);	//scale it
 
 					}
 
@@ -405,8 +425,8 @@ class ExploreDirectionEstimator{
 			
 					for(int j = 0; j<65; j+=1){
 									
-						pt.x = int(j* cos(dir[i]*0.017));			// use to degree /toRadian here later...
-						pt.z = int(j* sin(dir[i]*0.017));
+						pt.x = int(j* cos(toRadian(dir[i])) );			// use to degree /toRadian here later...
+						pt.z = int(j* sin(toRadian(dir[i])) );
 						pt.y = -1;
 		
 						pt.b = 150;
@@ -598,7 +618,7 @@ class ExploreDirectionEstimator{
 
 			for(int i=0; i<angularOccupancy.size(); ++i){
 				angularOccupancy[i] = 0;
-				angularOccupancyRho[i] = 99999;
+				angularOccupancyRho[i] = angularOccupancyMaxRho;
 			} 
 				
 			for(size_t i = 0; i<inputCloud->size(); ++i){								
@@ -721,13 +741,35 @@ class ExploreDirectionEstimator{
 					end= -1;
 			}
 			
-			int sizeOfIndices = gapsInAngularOccupancyEndInd.size();
+			//fixing the issue of not having a valid rho in the angularOccupancyrho vector when the 
+			
+			int sizeOfIndices = gapsInAngularOccupancyEndInd.size(); 			
+			/*if(sizeOfInd != 0)
+			{
+				int firstStartInd = gapsInAngularOccupancyStartInd[0] 
+				int lastEndInd = gapsInAngularOccupancyStartInd[sizeOfInd-1];
+			
+				if(gapsInAngularOccupancyStartInd.size() == 1){
+				
+					if(angularOccupancy[firstStartInd] == 0 )
+				}	
+			
+				if(fistStartInd != 0){
+			
+				if(angularOccupancy[firstStartInd-1] != 1){
+					
+					angularOccupancy[firstStartInd-1] = 1;
+					angualrOccupancyRho[[firstStartInd-1] =  angularOccupancyRho[firstStartInd+]
+				}
+			}*/
 			if(angularOccupancy[gapsInAngularOccupancyStartInd[0]] == 0){
 				angularOccupancyRho[gapsInAngularOccupancyStartInd[0]-1] = angularOccupancyRho[gapsInAngularOccupancyEndInd[0]];
 			}
 			if(angularOccupancy[gapsInAngularOccupancyEndInd[sizeOfIndices-1]] == 0){
 				angularOccupancyRho[gapsInAngularOccupancyEndInd[sizeOfIndices-1]] = angularOccupancyRho[gapsInAngularOccupancyStartInd[sizeOfIndices-1]-1];
 			}
+			
+			//cerr<<"getGaps-"<<
 			//if(gapsInAngularOccupancyEndInd[sizeOfIndices-1] == numOfAngularOccupancyBins-1 && angularOccupancy[numOfAngularOccupancyBins-1] == 0){
 			//	angularOccupancyRho[numOfAngularOccupancyBins-1] = angularOccupancyRho[gapsInAngularOccupancyStartInd[sizeOfIndices-1]-1];
 			//}
@@ -779,31 +821,27 @@ class ExploreDirectionEstimator{
 
 
 ExploreDirectionEstimator* estimateDir;
+cv::Scalar rpParams; 	//store the road plane parameters
 
-/* publish drive direction markers--BadDirs mean those direction which
- * might not be appropriate inspite of availability of safe drivable
- * gap in that directions..mostly because of to sharp turning required...
- * gapMark means a line being drawn in the gap of drivable gap
- * connectGap means connect the center and gap center while publishing the marker*/
-void publishDirections(const vector<float>& dirs,
-						const vector<cv::Point2f>& locs,
-						const vector<cv::Vec4f>& gapEndPoints,
-						std_msgs::Header h,
-						bool publishGapMark = false,
-						bool connectToGap = false,
-						bool rejectBadDirs = false)
-{
+
+// publish drive direction markers--BadDirs mean those direction which might not be appropriate inspite of availability of safe drivable
+// gap in that directions..mostly because of to sharp turning required...
+// gapMark means a line being drawn in the gap of drivable gap
+// connectGap means connect the center and gap center while publishing the marker
+void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& locs, const vector<cv::Vec4f>& gapEndPoints, std_msgs::Header h, bool publishGapMark = false, bool connectToGap = false, bool rejectBadDirs = false){
 	
 		visualization_msgs::Marker marker;
-		visualization_msgs::Marker gapMarker;
+		visualization_msgs::Marker gapMarker;	
+		geometry_msgs::PoseArray markerDirectinosAsPoses;
+		geometry_msgs::Pose poseOfMarker;
 		
-		marker.header = h;
+		markerDirectinosAsPoses.header = h;
+
+		marker.header = h;		
 		marker.ns = "drive_directions";
 		marker.id = 0;
 		marker.type = visualization_msgs::Marker::LINE_LIST;
 		marker.action = visualization_msgs::Marker::ADD;
-
-
 
 		if(publishGapMark){
 			gapMarker.header = h;
@@ -839,13 +877,13 @@ void publishDirections(const vector<float>& dirs,
 			// make gap markers - WE MIGHT HAVE TO SCALE THESE MARKERS AS MAY BE THEY ARE IN GRID COORDINATES..
 			p.x = (gapEndPoints[i])[0];
 			p.z = (gapEndPoints[i])[1];
-			p.y = 0;						// the height at which we want to show the marker...
+			p.y = rpParams[3]-estimateDir->getObstacleTolerance();						// the height at which we want to show the marker...
 			gapMarker.points.push_back(p);
 
 			// make gap markers
 			p.x = (gapEndPoints[i])[2];
 			p.z = (gapEndPoints[i])[3];
-			p.y = 0;						// the height at which we want to show the marker...
+			p.y = rpParams[3]-estimateDir->getObstacleTolerance();						// the height at which we want to show the marker...
 			gapMarker.points.push_back(p);			
 			
 			// from origin
@@ -862,17 +900,27 @@ void publishDirections(const vector<float>& dirs,
 				marker.points.push_back(p);
 	    	}
 	    	else{
+	    		cerr<<"locs"<<locs[i].x<<endl;
 	    		// to direction				    	
-				p.x = locs[i].x*0.1;// * cos(estimateDir->toRadian(dirs[i])) ;
-				p.y = 0;
-				p.z = locs[i].y*0.1;//locs * sin(estimateDir->toRadian(dirs[i])) ;
+				p.x = locs[i].x;// locs is in grid coordinates in which each unit is
+				p.y = rpParams[3]-estimateDir->getObstacleTolerance();
+				p.z = locs[i].y;//locs * sin(estimateDir->toRadian(dirs[i])) ;
 				marker.points.push_back(p);
 	    	}
+
+	    	geometry_msgs::Point p;
+	    	p.x = locs[i].x;// locs is in grid coordinates in which each unit is
+			p.y = rpParams[3]-estimateDir->getObstacleTolerance();
+			p.z = locs[i].y;//locs * sin(estimateDir->toRadian(dirs[i])) ;
+
+	    	poseOfMarker.position = p;
+	    	poseOfMarker.orientation =tf::createQuaternionMsgFromYaw(dirs[i]);		/// assuming the function takes in degree units
+	    	markerDirectinosAsPoses.poses.push_back(poseOfMarker);
 	    }
 		  
 		
 		marker.scale.x = 0.1;
-		marker.scale.y = 0.2;
+		marker.scale.y = 0.1;
 		marker.scale.z = 1;
 		
 		marker.color.b = 205;
@@ -883,12 +931,16 @@ void publishDirections(const vector<float>& dirs,
 		if(publishGapMark){
 			gapMarker.scale.x = 0.1;
 			
-			gapMarker.color.r = 55;
-			gapMarker.color.g = 255;
-			gapMarker.color.a = 1;
+			gapMarker.color.r = 53;
+			gapMarker.color.g = 220;
+			gapMarker.color.b = 0;
+			
+			gapMarker.color.a = 0.7;
 			gapMarker.lifetime = ros::Duration();
 			pubGapMarkersGlobal.publish(gapMarker);
 		}
+						
+		pubDriveDirectionAsPoses.publish(markerDirectinosAsPoses);
 }
 
 
@@ -928,18 +980,18 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 
 	 	// to store the color coded point cloud	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_ground(new pcl::PointCloud<pcl::PointXYZRGB>);			
-		point_cloud_ground->header.frame_id = "zed_optical_frame";//l_image_msg->header.frame_id;
+		point_cloud_ground->header.frame_id = point_cloud->header.frame_id;//l_image_msg->header.frame_id;
 		point_cloud_ground->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
 		point_cloud_ground->width = 1;
 	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_obstacle(new pcl::PointCloud<pcl::PointXYZRGB>);				
-		point_cloud_obstacle->header.frame_id = "zed_optical_frame";//l_image_msg->header.frame_id;
+		point_cloud_obstacle->header.frame_id = point_cloud->header.frame_id;//l_image_msg->header.frame_id;
 		point_cloud_obstacle->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
 		point_cloud_obstacle->width = 1;	
 
 	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_grid(new pcl::PointCloud<pcl::PointXYZRGB>);				
-		point_cloud_grid->header.frame_id = "zed_optical_frame";//l_image_msg->header.frame_id;
+		point_cloud_grid->header.frame_id = point_cloud->header.frame_id;//l_image_msg->header.frame_id;
 		point_cloud_grid->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
 		point_cloud_grid->width = 1;	
 		
@@ -980,7 +1032,7 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 		estimateDir->setPointCloud(point_cloud);
 	
 		//cerr<<point_cloud_seg->size()<<endl;
-		cv::Scalar rpParams = estimateDir->getPlaneParameters(point_cloud_ground);
+		rpParams = estimateDir->getPlaneParameters(point_cloud_ground);
 			
 		dirs.clear();
 		locs.clear();
@@ -1004,7 +1056,7 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 		pub_ground_points.publish(point_cloud_ground);
 		pub_obstacle_points.publish(point_cloud_obstacle);
 		
-		publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, false, true);
+		publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, true, true);
 		
 	}//if disparity
 
@@ -1025,7 +1077,7 @@ int main(int argc, char **argv){
 	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/stereo_camera/left/image_rect", 10);
 	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/stereo_camera/disparity", 10);
 	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/stereo_camera/left/camera_info_throttle", 10);
-	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/stereo_camera/right/camera_info_throttle", 10);   
+	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/stereo_camera/right/camera_info_throttle", 10);
 	
 	typedef sync_policies::ApproximateTime<Image, CameraInfo, CameraInfo, DisparityImage> myApprxSyncPolicy;
 	
@@ -1039,9 +1091,9 @@ int main(int argc, char **argv){
 	pub_ground_points = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("ground_points", 1);
 	pub_obstacle_points = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("obstacle_points", 1);
 		
-    pubDriveDirectionGlobal = n->advertise<visualization_msgs::Marker>("direction",1);	
-    pubGapMarkersGlobal = n->advertise<visualization_msgs::Marker>("gap_marker",1);	
-    
+    pubDriveDirectionGlobal = n->advertise<visualization_msgs::Marker>("drive_directions",1);	
+    pubGapMarkersGlobal = n->advertise<visualization_msgs::Marker>("gap_marks",1);	
+    pubDriveDirectionAsPoses = n->advertise<geometry_msgs::PoseArray>("directions_as_poses",1);
 	ros::spin();
 	
 	delete n;			// delete node handle pointer memory block
