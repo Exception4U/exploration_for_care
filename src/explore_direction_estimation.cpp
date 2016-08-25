@@ -974,7 +974,7 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 
 		// to store only the ground points	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-		point_cloud->header.frame_id = "zed_optical_frame";//l_image_msg->header.frame_id;
+		point_cloud->header.frame_id = "base_link";//l_image_msg->header.frame_id;
 		point_cloud->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
 		point_cloud->width = 1;
 
