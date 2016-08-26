@@ -23,20 +23,22 @@
 				  	  - /(namespace)/left/image_rect
 				  	  
 				  publishes
-				  	  - ~/ground_points
-				  	  - ~/obstacle_points
-				  	  - ~/grid_view 
-				  	  - ~/incomming_point_cloud (if coloring set...it is colored based on segmentation)
-				  	  - ~/drive_directions	(markers for drive direction)
-				  	  - ~/gap_marks (gaps are drawn as lines in green color)		
-				  	  - ~/direction_as_poses (drive directions as PoseArray msg - position - gapcenterpos, orientation - direction)
+				  	  - /explore/ground_points
+				  	  - /explore/obstacle_points
+				  	  - /explore/grid_view 
+				  	  - /explore/incomming_point_cloud (if coloring set...it is colored based on segmentation)
+				  	  - /explore/drive_directions	(markers for drive direction)
+				  	  - /explore/gap_marks (gaps are drawn as lines in green color)		
+				  	  - /explore/direction_as_poses (drive directions as PoseArray msg - position - gapcenterpos, orientation - direction)
 				  	  
 				  	  
 	Note - More info on parameters to be here soon....				  								  
 	
-	ToDo - publish a range of directions for ever gap so that the PLANNER node can decide upon which is most suitable
-	
-	kind of a problem - not a problem but sometimes I find that this node does not get the subscribed messages... dont know why...
+	To Do - publish a range of directions for ever gap so that the PLANNER node can decide upon which is most suitable		
+		  - Write callback for param change
+		  - when there is no plane fo fitting, keep the previous values of parameters
+		  - parameter for overriding marker height 
+		  - provide parameter for angle rejection
 	
 */
 
@@ -69,12 +71,12 @@
 #include <image_geometry/stereo_camera_model.h>
 
 #include <geometry_msgs/PoseArray.h>
+#include <nav_msgs/GridCells.h>
 #include <tf/transform_datatypes.h>
 
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
-
 
 
 using namespace ros;
@@ -88,11 +90,6 @@ using namespace geometry_msgs;
 
 long int pub_counter = 0;
 
-ros::Subscriber sub;
-ros::Subscriber imageSub_l;
-ros::Subscriber imageSub_r;
-ros::Subscriber sub_point_cloud;
-
 ros::Publisher pub_point_cloud;			// to publish the incoming point cloud (colored/not colored)
 ros::Publisher pub_ground_points;		// 			  ground points
 ros::Publisher pub_grid_view;			//		      grid view with possible drive directions		 
@@ -100,7 +97,8 @@ ros::Publisher pubDriveDirectionGlobal;	//			  possible drive directions as mark
 ros::Publisher pub_obstacle_points;
 ros::Publisher pubGapMarkersGlobal;		// publish gap markers
 ros::Publisher pubDriveDirectionAsPoses;
-bool useDisparity = true;
+ros::Publisher pubFreeSpaceMarker;
+int inputMode = 0;	// 0-disparity 1-point cloud
 
 ros::NodeHandle *n;
 
@@ -114,6 +112,7 @@ class ExploreDirectionEstimator{
 	
 		// constructor
 		ExploreDirectionEstimator(ros::NodeHandle* n){
+					
 			nh = n;
 			sizeOfGrid = 101;
 			centerOfGridInX = 50;
@@ -124,6 +123,9 @@ class ExploreDirectionEstimator{
 			angleOffset = 37;
 			colorPointCloud = false;
 			minGapForDriving = 1.5;
+			cameraHeightFromRoad = 0.9;
+			obstacleSegMethod = 0;
+			minHeightOfObstacle = 0.6;
 			
 			grid = cv::Mat::zeros(sizeOfGrid,sizeOfGrid,CV_8UC1);				
 		
@@ -137,8 +139,10 @@ class ExploreDirectionEstimator{
 			
 			planeFittingDistThres = 0.06;
 			// setup the parameters in the ros parameter server	-- loaded with the same default values as above
-			setupParameters();
 			setObstacleTolerance(0.3);
+			setGroundTolerance(0.1);
+
+			setupParameters();
 		}
 		
 		inline void setGridCenter(int inX, int inZ){
@@ -166,37 +170,12 @@ class ExploreDirectionEstimator{
 			roadPlaneParameters = planeParams;
 		}
 		
-		inline float getCameraHeightFromRoad(){
-			
-			return cameraHeightFromRoad;
-		}
 		// height of the camera from the road plane. used to segment points in a naive fasion as, points < height are obstacles
 		inline void setCameraHeightFromRoad(float height){
 			nh->setParam("cam_height", height);
 			cameraHeightFromRoad=height;
 		}		
-		
-		// returns if the point is an obstacle or not based on plane and minObstacle Height parameters
-		inline bool isObstacle(cv::Point3f p){
-		
-		    float e = (roadPlaneParameters[0]*p.x + roadPlaneParameters[1]*p.y + roadPlaneParameters[2]*p.z + roadPlaneParameters[3]);
-			return (p.y <roadPlaneParameters[3] && e>obstacleTolerance)?true:false;
- 			
-		}
-		
-		inline bool isGround(cv::Point3f p){
-			
-		    float e = (roadPlaneParameters[0]*p.x + roadPlaneParameters[1]*p.y + roadPlaneParameters[2]*p.z + roadPlaneParameters[3]);
-			return (p.y <roadPlaneParameters[3] && e<groundTolerance)?true:false;
-		}
-		
-		
-		// this functin can be used when we want qualify obstacles based on the height of from camera
-		inline bool isObstacleByHeight(cv::Point3f p, float height){
-			
-			return ((p.y <= height))?true:false;
-		}
-		
+
 		// set the maximum distance for the obstacle to consider it for angular occupancy bins
 		inline void setAngularOccupancyRhoMax(float rho){
 			nh->setParam("angular_occupancy_max_rho", rho);
@@ -207,12 +186,6 @@ class ExploreDirectionEstimator{
 		inline void setAngleOffset(float offset){
 			nh->setParam("angular_occupancy_angle_offset", offset);		
 			angleOffset = offset;
-		}		
-		inline float toDegree(float rad){
-			return rad*57.29580;
-		}
-		inline float toRadian(float deg){
-			return deg/57.29580;
 		}
 		
 		inline void setPlaneFittingDistThres(float thres){
@@ -236,15 +209,124 @@ class ExploreDirectionEstimator{
 			angularOccupancyResolution = res;
 		}
 
-		inline float getGroundTolerance(){
-			return groundTolerance;
+		inline void setMinHeighOfObstacle(float height){
+
+			minHeightOfObstacle = height;
+			nh->setParam("min_height_of_obstacle", height);
+			
 		}
 		
+		inline void setObstacleSegMethod(int method){
+			obstacleSegMethod = method;
+			if(method > 0){
+				obstacleSegMethod = 1;				
+			}
+			
+			nh->setParam("obstacle_segmentation_method", obstacleSegMethod);	
+		}
+
+		inline void setGroundTolerance(float groundTol){
 		
+			groundTolerance = groundTol;
+			nh->setParam("ground_tol", groundTol);				
+		}
+		
+		inline void setObstacleTolerance(float obstacleTol){
+		
+			obstacleTolerance = obstacleTol;		
+			nh->setParam("obstacle_tol", obstacleTol);				
+		}
+		
+		inline float getCameraHeightFromRoad(){
+			
+			return cameraHeightFromRoad;
+		}
+			
 		inline float getObstacleTolerance(){
 			return obstacleTolerance;
 		}
 		
+		inline float getMinHeightOfObstacle(){
+			return minHeightOfObstacle;
+		}
+		
+		
+		inline int getObstacleSegMethod(){
+			return obstacleSegMethod;
+		}
+
+		inline float getGroundTolerance(){
+			return groundTolerance;
+		}
+		
+		inline int getGridSize(){
+		
+			return sizeOfGrid;
+		}
+
+		inline float getAngularOccupancyMaxRho(){
+			return angularOccupancyMaxRho;
+		}
+		
+		inline float getAngularOccupancyResolution(){
+			return angularOccupancyResolution;
+		}
+		
+		inline float getMinGapForDriving(){
+			return minGapForDriving;
+		}
+		
+		inline float getPlaneFittingDistThres(){
+			return planeFittingDistThres;
+		}
+		
+		inline cv::Point2i getGridCenters(){
+			return cv::Point2i(centerOfGridInX, centerOfGridInZ);
+		}
+		
+		inline int getObstacleSegmentationMethod(){
+			return obstacleSegMethod;
+		}
+			
+		inline bool getPointColorFlag(){
+			return colorPointCloud;
+		}	
+		
+		inline cv::Scalar getRoadPlaneParameters(){
+			return roadPlaneParameters;
+		}
+		// returns if the point is an obstacle or not based on plane and minObstacle Height parameters
+		inline bool isObstacle(cv::Point3f p){
+		
+		    float e = (roadPlaneParameters[0]*p.x + roadPlaneParameters[1]*p.y + roadPlaneParameters[2]*p.z + roadPlaneParameters[3]);
+			return (p.y <roadPlaneParameters[3] && e>obstacleTolerance)?true:false;
+ 			
+		}
+		
+		inline bool isGround(cv::Point3f p){
+			
+		    float e = (roadPlaneParameters[0]*p.x + roadPlaneParameters[1]*p.y + roadPlaneParameters[2]*p.z + roadPlaneParameters[3]);
+			return (p.y <roadPlaneParameters[3] && e<groundTolerance)?true:false;
+		}
+		
+		inline bool isGroundByHeight(cv::Point3f p, float height){
+			
+		    return ((p.y > height))?true:false;
+		}
+		
+		// this functin can be used when we want qualify obstacles based on the height of from camera
+		inline bool isObstacleByHeight(cv::Point3f p, float height){
+			
+			return ((p.y <= height))?true:false;
+		}				
+						
+		inline float toDegree(float rad){
+			return rad*57.29580;
+		}
+		inline float toRadian(float deg){
+			return deg/57.29580;
+		}						
+							
 		// updates the passed allDriveDir (as reference) vector with all possible drive directions
 		// this interface does every thing, process pnt cld, get occupancies, and compute drive directions and gap locations
 		// possibleDriveDirections   - vector of all possible drivable directions in degrees
@@ -292,7 +374,7 @@ class ExploreDirectionEstimator{
 						
 						// perpendicular direction the gap opening
 						
-						cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
+						//cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
 						possibleDriveDirections.push_back(thetaGapCenter);
 						possibleDriveGapLocations.push_back(gapCenter);
 						possibleGapEndPoints.push_back(cv::Vec4f(x1,y1, x2,y2));
@@ -351,7 +433,7 @@ class ExploreDirectionEstimator{
 						if(thetaGapCenter < 0){						
 							thetaGapCenter += 180;
 						}
-						cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
+						//cerr<<"+"<<gapCenter<<"*"<<gapWidth<<endl;
 					
 						possibleDriveDirections.push_back(thetaGapCenter);
 						possibleDriveGapLocations.push_back(gapCenter);
@@ -378,9 +460,14 @@ class ExploreDirectionEstimator{
 				for(int j = 0; j<sizeOfGrid; ++j){	//x
 							
 					if(grid.at<uchar>(i,j) == 1){
-						pt.x = (j-centerOfGridInX)*0.1;
-						pt.y = 0;
+						pt.x = (j-centerOfGridInX)*0.1;						
 						pt.z = (i-centerOfGridInZ)*0.1;
+						
+						if(obstacleSegMethod == 0)
+							pt.y = minHeightOfObstacle;	// only height based
+						else
+							pt.y = roadPlaneParameters[3]-groundTolerance;  // plane based
+							
 						pt.b = 0;
 						pt.r = 250;
 						pt.g = 50;							
@@ -388,12 +475,56 @@ class ExploreDirectionEstimator{
 					}
 					if(grid.at<uchar>(i,j) == 0 && !onlyObstacle){
 						pt.x = (j-centerOfGridInX)*0.1;
-						pt.y = 0;
 						pt.z = (i-centerOfGridInZ)*0.1;
+
+						if(obstacleSegMethod == 0)
+							pt.y = minHeightOfObstacle;
+						else
+							pt.y = roadPlaneParameters[3]-groundTolerance;  
+
 						pt.b = 0;
 						pt.r = 0;
 						pt.g = 90;							
 						cloud->push_back(pt);	//scale it
+
+					}
+
+				}
+			}
+		
+		}
+		
+		
+		// puts the grid in nav_gridCells msg format  form into the passed pcl ptr... if only_obstacle flag is True then ony obstacles are passed 
+		void getGridAsOccupencyGrid(nav_msgs::GridCells& asCells){
+			
+			geometry_msgs::Point pt;
+			// make a vector from grid[][] for now to display the grid as the PCL message in RVIZ
+			for(int i = 0; i<sizeOfGrid; ++i){		//z
+				for(int j = 0; j<sizeOfGrid; ++j){	//x
+							
+					if(grid.at<uchar>(i,j) == 1){
+						pt.x = (j-centerOfGridInX);						
+						pt.z = (i-centerOfGridInZ);
+						
+						if(obstacleSegMethod == 0)
+							pt.y = minHeightOfObstacle;	// only height based
+						else
+							pt.y = roadPlaneParameters[3]-groundTolerance;  // plane based
+							
+						asCells.cells.push_back(pt);	//scale it	        	
+
+					}
+					if(grid.at<uchar>(i,j) == 0){
+						pt.x = (j-centerOfGridInX);
+						pt.z = (i-centerOfGridInZ);
+
+						if(obstacleSegMethod == 0)
+							pt.y = minHeightOfObstacle;
+						else
+							pt.y = roadPlaneParameters[3]-groundTolerance;  
+												
+						asCells.cells.push_back(pt);	//scale it
 
 					}
 
@@ -454,7 +585,6 @@ class ExploreDirectionEstimator{
 					
 				cerr<<angularOccupancyRho[i]<<" ";
 			}
-			cerr<<"------------"<<endl;
 		}
 		
 		
@@ -470,7 +600,8 @@ class ExploreDirectionEstimator{
 				p.x = inputCloud->points[i].x;
 				p.y = inputCloud->points[i].y;
 				p.z = inputCloud->points[i].z;								
-				if(isGround(p)){
+				
+				if( (obstacleSegMethod == 1 && isGround(p)) || (obstacleSegMethod == 0 && isGroundByHeight(p,minHeightOfObstacle)) ){						
 				
 					cloud->push_back(inputCloud->points[i]);
 				}
@@ -488,9 +619,9 @@ class ExploreDirectionEstimator{
 				
 				p.x = inputCloud->points[i].x;
 				p.y = inputCloud->points[i].y;
-				p.z = inputCloud->points[i].z;								
-				if(isObstacle(p)){
-				
+				p.z = inputCloud->points[i].z;
+
+				if( (obstacleSegMethod == 1 && isObstacle(p)) || (obstacleSegMethod == 0 && isObstacleByHeight(p,minHeightOfObstacle)) ){						
 					cloud->push_back(inputCloud->points[i]);
 				}
 			}
@@ -498,8 +629,9 @@ class ExploreDirectionEstimator{
 		}
 		
 		
+		
 		// fit plane to the passed point cloud and return the parameters as cv::Scalar i.e. 4 parameters
-		cv::Scalar getPlaneParameters(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr p){
+		cv::Scalar fitRoadPlane(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr p){
 		
 			  if(p->size() > 40){
 
@@ -515,13 +647,12 @@ class ExploreDirectionEstimator{
 				seg.setMethodType (pcl::SAC_RANSAC);
 				seg.setDistanceThreshold (planeFittingDistThres);
 
-
 				seg.setInputCloud (p);
 				seg.segment (*inliers, *coefficients);  
 				  
 				cv::Scalar planeParameters(coefficients->values[0],coefficients->values[1],coefficients->values[2],coefficients->values[3]);
 	
-				std::cerr << "Model coefficients: " << coefficients->values[0] << " " 
+				std::cerr << "-Model coefficients: " << coefficients->values[0] << " " 
 								                    << coefficients->values[1] << " "
 								                    << coefficients->values[2] << " " 
 								                    << coefficients->values[3] << std::endl;
@@ -557,46 +688,58 @@ class ExploreDirectionEstimator{
 				nh->getParam("plane_fitting_distance_thres", planeFittingDistThres);
 				nh->getParam("color_input_cloud", colorPointCloud);
 				nh->getParam("grid_center_x", centerOfGridInX);
-				nh->getParam("grid_center_z", centerOfGridInZ);				
+				nh->getParam("grid_center_z", centerOfGridInZ);
+				nh->getParam("obstacle_segmentation_method", obstacleSegMethod);				
+				nh->getParam("min_height_for_obstacles",minHeightOfObstacle);
+				
 				// make it false again
 				nh->setParam("load_params", false);
 			}
 			
+		}				
+		
+		
+		// it prints out all the parameters
+		void printAllParameters(){
+			
+				printf("%32s - %f\n","ground_tol", groundTolerance);			
+				printf("%32s - %f\n","obstacle_tol", obstacleTolerance);		
+				printf("%32s - %d\n","grid_size", sizeOfGrid);			
+				printf("%32s - %f\n","cam_height", cameraHeightFromRoad);
+				printf("%32s - %f\n","angular_occupancy_max_rho", angularOccupancyMaxRho);
+				printf("%32s - %f\n","angular_occupancy_angle_offset", angleOffset);
+				printf("%32s - %i\n","angular_occupancy_resolution", angularOccupancyResolution);						
+				printf("%32s - %f\n","min_safe_driving_gap", minGapForDriving);
+				printf("%32s - %f\n","plane_fitting_distance_thres", planeFittingDistThres);
+				printf("%32s - %d\n","color_input_cloud", colorPointCloud);
+				printf("%32s - %d\n","grid_center_x", centerOfGridInX);
+				printf("%32s - %d\n","grid_center_z", centerOfGridInZ);
+				printf("%32s - %d\n","obstacle_segmentation_method", obstacleSegMethod);				
+				printf("%32s - %f\n","min_height_for_obstacles",minHeightOfObstacle);
 		}
-		
-		inline void setGroundTolerance(float groundTol){
-		
-			groundTolerance = groundTol;
-			nh->setParam("ground_tol", groundTol);				
-		}
-		
-		inline void setObstacleTolerance(float obstacleTol){
-		
-			obstacleTolerance = obstacleTol;		
-			nh->setParam("obstacle_tol", obstacleTol);				
-		}
-		
 		
 	private:
 	
 		// sets up parameters for dynamic change using "rosparam set" command
 		void setupParameters(){
 		
-			nh->setParam("load_params", false);		// flag to load parameters from server in to the node	
-			nh->setParam("ground_tol", 0.1);			// tolerance for extracting ground
-			nh->setParam("obstacle_tol", 0.3);		// tolerance for extracting obstacle
+			nh->setParam("load_params",true);		// flag to load parameters from server in to the node	
+			nh->setParam("ground_tol", 0.06);			// tolerance for extracting ground
+			nh->setParam("obstacle_tol", 0.215);		// tolerance for extracting obstacle
 			nh->setParam("grid_size", 101);			// grid size
 			nh->setParam("cam_height", 0.9);
-			nh->setParam("angular_occupancy_max_rho", 8);
+			nh->setParam("angular_occupancy_max_rho", 5.5);
 			nh->setParam("angular_occupancy_angle_offset", 35);
 			nh->setParam("angular_occupancy_resolution", 1);						
-			nh->setParam("min_safe_driving_gap", 1.5);
+			nh->setParam("min_safe_driving_gap", 1.3);
 			nh->setParam("plane_fitting_distance_thres", 0.06);
 			nh->setParam("color_input_cloud", false);
 			nh->setParam("grid_center_x", 50);
 			nh->setParam("grid_center_z", 0);
+			nh->setParam("obstacle_segmentation_method", 0);	//0 - height based, 1- plane based
+			nh->setParam("min_height_for_obstacles",0.6);		// anthing above this is an obstacle - used only for height based segment.
 			
-			
+			printAllParameters();
 		}
 
 
@@ -609,13 +752,14 @@ class ExploreDirectionEstimator{
 		}
 
 		
-		// this processes the cloud and generates OccupancyGrid (not probabilistic as of now) and angular Occupancy 
+		// this  ses the cloud and generates OccupancyGrid (not probabilistic as of now) and angular Occupancy 
 		// bins all in one loop
 		void processCloud(){
 		
 			//on every iteration make+inititalize grid to make sure that grid is cleared and if size has changed then it is allocated accordingly
+			makeGrid();
 			grid.setTo(cv::Scalar(0));
-
+			
 			for(int i=0; i<angularOccupancy.size(); ++i){
 				angularOccupancy[i] = 0;
 				angularOccupancyRho[i] = angularOccupancyMaxRho;
@@ -626,10 +770,10 @@ class ExploreDirectionEstimator{
 				float x = inputCloud->points[i].x;
 				float z = inputCloud->points[i].z;	
 				float y = inputCloud->points[i].y;
-				
+				cv::Point3f p(x,y,z);
 				// process the points i.e. make grid/make angular occupancies if and only if they are obstacles 
-				if( isObstacle(cv::Point3f(x,y,z)) ){
-				
+				if( (obstacleSegMethod == 1 && isObstacle(p)) || (obstacleSegMethod == 0 && isObstacleByHeight(p,minHeightOfObstacle)) ){
+
 					// coloring enabled
 				    if(colorPointCloud){
 				    	inputCloud->points[i].r = 200;
@@ -744,35 +888,14 @@ class ExploreDirectionEstimator{
 			//fixing the issue of not having a valid rho in the angularOccupancyrho vector when the 
 			
 			int sizeOfIndices = gapsInAngularOccupancyEndInd.size(); 			
-			/*if(sizeOfInd != 0)
-			{
-				int firstStartInd = gapsInAngularOccupancyStartInd[0] 
-				int lastEndInd = gapsInAngularOccupancyStartInd[sizeOfInd-1];
 			
-				if(gapsInAngularOccupancyStartInd.size() == 1){
-				
-					if(angularOccupancy[firstStartInd] == 0 )
-				}	
-			
-				if(fistStartInd != 0){
-			
-				if(angularOccupancy[firstStartInd-1] != 1){
-					
-					angularOccupancy[firstStartInd-1] = 1;
-					angualrOccupancyRho[[firstStartInd-1] =  angularOccupancyRho[firstStartInd+]
-				}
-			}*/
 			if(angularOccupancy[gapsInAngularOccupancyStartInd[0]] == 0){
 				angularOccupancyRho[gapsInAngularOccupancyStartInd[0]-1] = angularOccupancyRho[gapsInAngularOccupancyEndInd[0]];
 			}
 			if(angularOccupancy[gapsInAngularOccupancyEndInd[sizeOfIndices-1]] == 0){
 				angularOccupancyRho[gapsInAngularOccupancyEndInd[sizeOfIndices-1]] = angularOccupancyRho[gapsInAngularOccupancyStartInd[sizeOfIndices-1]-1];
 			}
-			
-			//cerr<<"getGaps-"<<
-			//if(gapsInAngularOccupancyEndInd[sizeOfIndices-1] == numOfAngularOccupancyBins-1 && angularOccupancy[numOfAngularOccupancyBins-1] == 0){
-			//	angularOccupancyRho[numOfAngularOccupancyBins-1] = angularOccupancyRho[gapsInAngularOccupancyStartInd[sizeOfIndices-1]-1];
-			//}
+						
 	
 		}	
 
@@ -811,6 +934,9 @@ class ExploreDirectionEstimator{
 		float groundTolerance;		
 		float obstacleTolerance;
 		float planeFittingDistThres;
+		int obstacleSegMethod;						// segment obstacle via Plane fitting on road (1) or just by height (0);
+		float minHeightOfObstacle;						// used in just height based obstacle segmentation
+
 		
 };
 
@@ -821,28 +947,50 @@ class ExploreDirectionEstimator{
 
 
 ExploreDirectionEstimator* estimateDir;
-cv::Scalar rpParams; 	//store the road plane parameters
 
+float maxZforPlaneFit;
+float maxXforPlaneFit;
+float maxYforPlaneFit;
+
+float minZ,maxY;
+float markerPosOffset;
 
 // publish drive direction markers--BadDirs mean those direction which might not be appropriate inspite of availability of safe drivable
 // gap in that directions..mostly because of to sharp turning required...
 // gapMark means a line being drawn in the gap of drivable gap
 // connectGap means connect the center and gap center while publishing the marker
-void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& locs, const vector<cv::Vec4f>& gapEndPoints, std_msgs::Header h, bool publishGapMark = false, bool connectToGap = false, bool rejectBadDirs = false){
-	
+void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& locs, const vector<cv::Vec4f>& gapEndPoints, std_msgs::Header h, bool publishGapMark = false, bool connectToGap = false, bool rejectBadDirs = false){		
+		
 		visualization_msgs::Marker marker;
 		visualization_msgs::Marker gapMarker;	
+		visualization_msgs::Marker freeSpace;
+		
 		geometry_msgs::PoseArray markerDirectinosAsPoses;
 		geometry_msgs::Pose poseOfMarker;
 		
+		//h.frame_id="my_zed_optical_frame";			// for debuggin only -- to be removed;
+		
 		markerDirectinosAsPoses.header = h;
-
+		
 		marker.header = h;		
 		marker.ns = "drive_directions";
 		marker.id = 0;
 		marker.type = visualization_msgs::Marker::LINE_LIST;
 		marker.action = visualization_msgs::Marker::ADD;
 
+		float markerHeight;
+		cv::Scalar roadPlaneParams;
+		
+		if(estimateDir->getObstacleSegmentationMethod() == 0){
+			markerHeight = estimateDir->getMinHeightOfObstacle();
+		}
+		else{
+			roadPlaneParams = estimateDir->getRoadPlaneParameters();
+			markerHeight= roadPlaneParams[3]-estimateDir->getObstacleTolerance();	// right on the base of obstacles
+		}
+		
+		markerHeight = markerPosOffset + markerHeight;
+		
 		if(publishGapMark){
 			gapMarker.header = h;
 			gapMarker.ns="gap_markers";
@@ -850,6 +998,14 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 			gapMarker.type = visualization_msgs::Marker::LINE_LIST;
 			gapMarker.action = visualization_msgs::Marker::ADD;
 		}
+		
+	
+			freeSpace.header = h;
+			freeSpace.ns="gap_markers";
+			freeSpace.id = 0;
+			freeSpace.type = visualization_msgs::Marker::TRIANGLE_LIST;
+			freeSpace.action = visualization_msgs::Marker::ADD;
+		
 
 		// construct the directions with line_list 		
 	    geometry_msgs::Point p;	    
@@ -865,7 +1021,6 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 						if( (gapEndPoints[i])[0] != (gapEndPoints[i])[2] ){
 						
 							 float perpGapDir= estimateDir->toDegree(atan( abs((gapEndPoints[i])[1]-(gapEndPoints[i])[3]) / abs((gapEndPoints[i])[0]-(gapEndPoints[i])[2]) ) );      							 
-							 cerr<<90-perpGapDir<<endl;
 							 //reject perpendicular dir below certain threshold 
 							 if(90-perpGapDir < 40) 				// note: a vertical gap in Z has 90-perpGapDir = 0
 							 	continue;	//skip this drive direction 
@@ -874,28 +1029,40 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 					
 			}
 			
-			// make gap markers - WE MIGHT HAVE TO SCALE THESE MARKERS AS MAY BE THEY ARE IN GRID COORDINATES..
+			//make free space using triangle list
+			p.x = p.z = 0;
+			p.y = markerHeight;
+			freeSpace.points.push_back(p);
+			
+			// make gap markers 			
 			p.x = (gapEndPoints[i])[0];
 			p.z = (gapEndPoints[i])[1];
-			p.y = rpParams[3]-estimateDir->getObstacleTolerance();						// the height at which we want to show the marker...
+			p.y = markerHeight;
 			gapMarker.points.push_back(p);
-
+			freeSpace.points.push_back(p);
 			// make gap markers
 			p.x = (gapEndPoints[i])[2];
 			p.z = (gapEndPoints[i])[3];
-			p.y = rpParams[3]-estimateDir->getObstacleTolerance();						// the height at which we want to show the marker...
-			gapMarker.points.push_back(p);			
+			p.y = markerHeight;
+			gapMarker.points.push_back(p);
+			freeSpace.points.push_back(p);												
+			
+			freeSpace.scale.x = 1;
+			freeSpace.scale.y = 1;
+			freeSpace.scale.z = 1;
+			freeSpace.color.a = 0.5;
+			freeSpace.color.g = 200;
 			
 			// from origin
 			p.x = 0;
-			p.y = 0;
+			p.y = markerHeight;
 			p.z = 0;
 			marker.points.push_back(p);
 			
 			if(!connectToGap){
 				// to direction				    	
 				p.x = 2 * cos(estimateDir->toRadian(dirs[i])) ;
-				p.y = 0;
+				p.y = markerHeight;
 				p.z = 2 * sin(estimateDir->toRadian(dirs[i])) ;
 				marker.points.push_back(p);
 	    	}
@@ -903,18 +1070,18 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 	    		cerr<<"locs"<<locs[i].x<<endl;
 	    		// to direction				    	
 				p.x = locs[i].x;// locs is in grid coordinates in which each unit is
-				p.y = rpParams[3]-estimateDir->getObstacleTolerance();
+				p.y = markerHeight;//rpParams[3]-estimateDir->getObstacleTolerance();
 				p.z = locs[i].y;//locs * sin(estimateDir->toRadian(dirs[i])) ;
 				marker.points.push_back(p);
 	    	}
 
 	    	geometry_msgs::Point p;
-	    	p.x = locs[i].x;// locs is in grid coordinates in which each unit is
-			p.y = rpParams[3]-estimateDir->getObstacleTolerance();
-			p.z = locs[i].y;//locs * sin(estimateDir->toRadian(dirs[i])) ;
+	    	p.x = 0;// locs is in grid coordinates in which each unit is
+			p.y = markerHeight;//rpParams[3]-estimateDir->getObstacleTolerance();
+			p.z = 0;//locs * sin(estimateDir->toRadian(dirs[i])) ;
 
 	    	poseOfMarker.position = p;
-	    	poseOfMarker.orientation =tf::createQuaternionMsgFromYaw(dirs[i]);		/// assuming the function takes in degree units
+	    	poseOfMarker.orientation =tf::createQuaternionMsgFromRollPitchYaw(dirs[i],0,0);		/// assuming the function takes in degree units
 	    	markerDirectinosAsPoses.poses.push_back(poseOfMarker);
 	    }
 		  
@@ -929,41 +1096,61 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 		pubDriveDirectionGlobal.publish(marker);
 		
 		if(publishGapMark){
-			gapMarker.scale.x = 0.1;
-			
+			gapMarker.scale.x = 0.15;
+			gapMarker.scale.z = 1;
 			gapMarker.color.r = 53;
-			gapMarker.color.g = 220;
-			gapMarker.color.b = 0;
+			gapMarker.color.g = 50;
+			gapMarker.color.b = 200;
 			
-			gapMarker.color.a = 0.7;
+			gapMarker.color.a = 0.6;
 			gapMarker.lifetime = ros::Duration();
 			pubGapMarkersGlobal.publish(gapMarker);
 		}
 						
 		pubDriveDirectionAsPoses.publish(markerDirectinosAsPoses);
+		pubFreeSpaceMarker.publish(freeSpace);
 }
 
 
 
+/* callback for disparity, l_image, both info messages.
+   This function operates on disparity images. It first computes the point cloud from disparity and then
+   computes directins, grid, ground, obstacles, etc.. and publish them.
+*/
 
-void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
-                                 const CameraInfoConstPtr& l_info_msg,
-                                 const CameraInfoConstPtr& r_info_msg,
-                                 const DisparityImageConstPtr& disp_msg) {
+void computeDirectionsFromDisparity( const ImageConstPtr& l_image_msg,
+                                 	 const CameraInfoConstPtr& l_info_msg,
+                                 	 const CameraInfoConstPtr& r_info_msg,
+                                 	 const DisparityImageConstPtr& disp_msg) {
 
-	if(useDisparity){
-		float maxZforPlaneFit;
-		float maxXforPlaneFit;
-		n->getParam("maxZforPlaneFitting",maxZforPlaneFit);
-		n->getParam("maxXforPlaneFitting",maxXforPlaneFit);
-		
+	int inputMode;
+	n->getParam("input_mode", inputMode);
+	if(inputMode == 0){	// disparity mode
+	
+	
+		bool loadParam;
+
 		// load the parameters .. parameters only change if "load_params" is true;
+
+		// this sequence of loading these parameters and then calling loadParameters() is important...dont change the sequence as
+		// if we call loadParameters() before then the load_params value will be set to FALSE and hence max_Z...these parameters will not change
+		n->getParam("load_params",loadParam);
+		if(loadParam){
+			n->getParam("max_Z_for_plane_fitting",maxZforPlaneFit);
+			n->getParam("max_X_for_plane_fitting",maxXforPlaneFit);
+			n->getParam("max_Y_for_plane_fitting",maxYforPlaneFit);
+			n->getParam("marker_z_position_offset",markerPosOffset);
+			n->getParam("min_Z",minZ);	//for trimming incoming point cloud or point cloud from disparty
+			n->getParam("max_Y",maxY);	// "
+		
+		}			
 		estimateDir->loadParameters();
 		
+		
 		// look for and change grid size from ros param value - "grid_size"
-		int grSize;		
-		if(n->getParam("grid_size",grSize))
-			estimateDir->setGridSize(grSize);
+		//int grSize;		
+		//if(n->getParam("grid_size",grSize))
+			//estimateDir->setGridSize(grSize);
 			
 		cv_bridge::CvImageConstPtr cv_ptr, cv_ptr_d;
 		cv_ptr = cv_bridge::toCvShare(l_image_msg, sensor_msgs::image_encodings::TYPE_32FC1);
@@ -974,9 +1161,9 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 
 		// to store only the ground points	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-		point_cloud->header.frame_id = "base_link";//l_image_msg->header.frame_id;
+		point_cloud->header.frame_id = "my_zed_optical_frame";//l_image_msg->header.frame_id;
 		point_cloud->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
-		point_cloud->width = 1;
+		point_cloud->width = 1;	
 
 	 	// to store the color coded point cloud	
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_ground(new pcl::PointCloud<pcl::PointXYZRGB>);			
@@ -995,7 +1182,7 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 		point_cloud_grid->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
 		point_cloud_grid->width = 1;	
 		
-		for(size_t i =cv_ptr_d->image.rows/2; i <=cv_ptr_d->image.rows; ++i){
+		for(size_t i =cv_ptr_d->image.rows/2; i <=cv_ptr_d->image.rows; ++i){	//cv_ptr_d->image.rows/2
 			for(size_t j =0; j <=cv_ptr_d->image.cols; ++j){
 			
 				
@@ -1005,7 +1192,9 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 					model.projectDisparityTo3d(px, disp, point);
 					pcl::PointXYZRGB p;
 					// != image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z) 
-					if(point.y >0 && point.z > 0 && point.z<20 &&  point.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z)){
+					
+						
+					if(point.y >maxY && point.z > minZ && point.z<=estimateDir->getGridSize()*0.1 &&  point.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z) && !isnan(point.z)){
 
 						p.x = point.x;
 						p.y = point.y;
@@ -1015,7 +1204,7 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 						p.b = cv_ptr->image.at<float>(i,j);
 					
 						// points to be passed for plane fitting
-						if( p.x >=-maxXforPlaneFit && p.x <= maxXforPlaneFit && p.z<maxZforPlaneFit && p.y>estimateDir->getCameraHeightFromRoad() - 0.3){  //p.y>1.4 only for kitti_set
+						if( p.x >=-maxXforPlaneFit && p.x <= maxXforPlaneFit && p.z<maxZforPlaneFit && p.y>maxYforPlaneFit){  //p.y>1.4 only for kitti_set
 											
 							point_cloud_ground->push_back(p);
 		
@@ -1031,8 +1220,9 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 
 		estimateDir->setPointCloud(point_cloud);
 	
-		//cerr<<point_cloud_seg->size()<<endl;
-		rpParams = estimateDir->getPlaneParameters(point_cloud_ground);
+	    //fit plane only when obstacle segmentation method = 1 i.e. road plane fitting based		
+		if(estimateDir->getObstacleSegMethod() == 1)
+			cv::Scalar rpParams = estimateDir->fitRoadPlane(point_cloud_ground);
 			
 		dirs.clear();
 		locs.clear();
@@ -1042,10 +1232,9 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 		point_cloud_ground->clear();
 	
 		estimateDir->getGridAsPointCloud(point_cloud_grid, false);		// with free space rendered
-		estimateDir->renderPossibleDriveDirectionsOnGrid(point_cloud_grid, dirs, locs);
-	
+						
 	//  GROUND POINTS --- point_cloud_new
-	
+		
 		float tol=0.1;
 		n->getParam("ground_tol", tol);
 		estimateDir->getGroundPoints(point_cloud_ground);
@@ -1056,35 +1245,161 @@ void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
 		pub_ground_points.publish(point_cloud_ground);
 		pub_obstacle_points.publish(point_cloud_obstacle);
 		
-		publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, true, true);
-		
+		publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, false  , true);
+
 	}//if disparity
 
 }
 
 
-int main(int argc, char **argv){		
-		
+
+/* callback for point cloud of type PointCloud2.
+   This function directly operates on the incoming point cloud and then
+   computes directins, grid, ground, obstacles, etc.. and publish them.
+*/
+
+void computeDirectionsFromPointCloud(const sensor_msgs::PointCloud2ConstPtr &cloud){
+				
+	int inputMode;
+	n->getParam("input_mode", inputMode);
+	if(inputMode == 1){	//point clloud mode
+
 	
+		bool loadParam;
+
+		// load the parameters .. parameters only change if "load_params" is true;
+
+		// this sequence of loading these parameters and then calling loadParameters() is important...dont change the sequence as
+		// if we call loadParameters() before then the load_params value will be set to FALSE and hence max_Z...these parameters will not change
+		n->getParam("load_params",loadParam);
+		if(loadParam){
+			n->getParam("max_Z_for_plane_fitting",maxZforPlaneFit);
+			n->getParam("max_X_for_plane_fitting",maxXforPlaneFit);
+			n->getParam("max_Y_for_plane_fitting",maxYforPlaneFit);
+			n->getParam("marker_z_position_offset",markerPosOffset);
+			n->getParam("min_Z",minZ);	//for trimming incoming point cloud or point cloud from disparty
+			n->getParam("max_Y",maxY);	// "
+		
+		}			
+		estimateDir->loadParameters();
+
+		// to store only the ground points	
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_conv(new pcl::PointCloud<pcl::PointXYZRGB>);
+		
+		pcl::fromROSMsg(*cloud, *point_cloud_conv);
+		point_cloud_conv->width = 1;	
+		
+		// to store the color coded point cloud	
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);			
+		point_cloud->header = point_cloud_conv->header;
+		point_cloud->width = 1;
+		
+	 	// to store the color coded point cloud	
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_ground(new pcl::PointCloud<pcl::PointXYZRGB>);			
+		point_cloud_ground->header = point_cloud->header;
+		point_cloud_ground->width = 1;
+	
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_obstacle(new pcl::PointCloud<pcl::PointXYZRGB>);				
+		point_cloud_obstacle->header = point_cloud->header;
+		point_cloud_obstacle->width = 1;	
+
+	
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_grid(new pcl::PointCloud<pcl::PointXYZRGB>);				
+		point_cloud_grid->header = point_cloud->header;
+		point_cloud_grid->width = 1;	
+				
+		cv::Point3f p;
+		// make points for road to be fit to be fit..
+		for(size_t i = 0; i<point_cloud_conv->size(); ++i){
+			
+			
+			p.x = point_cloud_conv->points[i].x;
+			p.y = point_cloud_conv->points[i].y;
+			p.z = point_cloud_conv->points[i].z;				       
+			if(p.y >maxY && p.z > minZ && p.z<=estimateDir->getGridSize()*0.1 && p.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(p.z) && !isnan(p.z)){
+				
+				// points to be passed for plane fitting
+				if( p.x >=-maxXforPlaneFit && p.x <= maxXforPlaneFit && p.z<maxZforPlaneFit && p.y>maxYforPlaneFit){  //p.y>1.4 only for kitti_set
+					point_cloud_ground->push_back(point_cloud_conv->points[i]);
+
+				}
+				
+				point_cloud->push_back(point_cloud_conv->points[i]);
+			}
+					
+		}
+		
+		estimateDir->setPointCloud(point_cloud);
+		
+		//fit plane only when obstacle segmentation method = 1 i.e. road plane fitting based		
+		if(estimateDir->getObstacleSegMethod() == 1)
+			cv::Scalar rpParams = estimateDir->fitRoadPlane(point_cloud_ground);
+			
+		dirs.clear();
+		locs.clear();
+	    gapEndPoints.clear();
+	    
+		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints);	
+		point_cloud_ground->clear();
+	
+		estimateDir->getGridAsPointCloud(point_cloud_grid, false);		// with free space rendered
+						
+	//  GROUND POINTS --- point_cloud_new
+		
+		estimateDir->getGroundPoints(point_cloud_ground);
+		estimateDir->getObstaclePoints(point_cloud_obstacle);	
+		
+		pub_point_cloud.publish(point_cloud);
+		pub_grid_view.publish(point_cloud_grid);
+		pub_ground_points.publish(point_cloud_ground);
+		pub_obstacle_points.publish(point_cloud_obstacle);
+		
+		publishDirections(dirs, locs, gapEndPoints, cloud->header, true, false, true);
+		
+	}
+}
+
+
+int main(int argc, char **argv){		
+
+
+	printf("\n\n%32s - %s\n","Parameters","Values");
+	printf("%32s - %s\n","--------------------------------","----------");
+			
     ros::init(argc, argv, "explore");
 	n = new ros::NodeHandle("~");
-	n->setParam("maxZforPlaneFitting", 10);
-	n->setParam("maxXforPlaneFitting", 1);
+
+	estimateDir = new ExploreDirectionEstimator(n);
+
+	n->setParam("max_Z_for_plane_fitting", 10);
+	n->setParam("max_X_for_plane_fitting", 1);
+	n->setParam("max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);
+	n->setParam("min_Z", 1.5);
+	n->setParam("max_Y", -1.0);
+	n->setParam("marker_z_position_offset",0);
+	n->setParam("input_mode", 1);	//0-means use disparity, 1- use point cloud
 	
-	estimateDir = new ExploreDirectionEstimator(n);	
 	
-		
-	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/stereo_camera/left/image_rect", 10);
-	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/stereo_camera/disparity", 10);
-	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/stereo_camera/left/camera_info_throttle", 10);
-	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/stereo_camera/right/camera_info_throttle", 10);
-	
+	printf("%32s - %f\n","marker_z_position_offset",0.0);
+	printf("%32s - %f\n","max_Z_for_plane_fitting", 10.0);			
+	printf("%32s - %f\n","max_X_for_plane_fitting", 1.0);		
+	printf("%32s - %f\n","max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);			
+	printf("%32s - %f\n","min_Z", 1.5);		
+	printf("%32s - %f\n","max_Y", -1.0);
+	printf("%32s - %i\n","input_method", 1);	
+
+	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/camera/left/image_rect", 10);
+	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/camera/disparity", 10);
+	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/camera/left/camera_info", 10);
+	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/camera/right/camera_info", 10);   
+
 	typedef sync_policies::ApproximateTime<Image, CameraInfo, CameraInfo, DisparityImage> myApprxSyncPolicy;
 	
 	Synchronizer<myApprxSyncPolicy> sync(myApprxSyncPolicy(10), sub_l_img, sub_l_info,sub_r_info, sub_disp_img);
-	sync.registerCallback(boost::bind(pointCloudFromDisparity, _1, _2,_3,_4));
-		
-	
+	sync.registerCallback(boost::bind(computeDirectionsFromDisparity, _1, _2,_3,_4));
+
+	ros::Subscriber sub_point_cloud = n->subscribe("/camera/points2/", 10, computeDirectionsFromPointCloud);
+
     //sub = nh.subscribe("/camera/points2", 100, pointCloudFromDisparity);  
 	pub_point_cloud = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("incoming_point_cloud", 1);
 	pub_grid_view = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("grid_view", 1);
@@ -1093,564 +1408,15 @@ int main(int argc, char **argv){
 		
     pubDriveDirectionGlobal = n->advertise<visualization_msgs::Marker>("drive_directions",1);	
     pubGapMarkersGlobal = n->advertise<visualization_msgs::Marker>("gap_marks",1);	
-    pubDriveDirectionAsPoses = n->advertise<geometry_msgs::PoseArray>("directions_as_poses",1);
+    pubDriveDirectionAsPoses = n->advertise<geometry_msgs::PoseArray>("directions_as_poses",1);    
+    pubFreeSpaceMarker = n->advertise<visualization_msgs::Marker>("free_space_marker", 1);
+    
 	ros::spin();
 	
 	delete n;			// delete node handle pointer memory block
 	delete estimateDir;	
 }
-	
 
-
-
-
-
-/*
-// call back for the point cloud topic consisiting of only obstacles
-void onlyObstaclePointCloudCallback(const sensor_msgs::PointCloud2ConstPtr points){
-
-
-		
-	if(usePointCloud){	
-		
-			
-		
-		// to store only the ground points	
-		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-	
-		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_grid(new pcl::PointCloud<pcl::PointXYZRGB>);				
-		point_cloud_grid->header = point_cloud->header;
-		point_cloud_grid->header.frame_id = "kitti_stereo";//l_image_msg->header.frame_id;
-		point_cloud_grid->width = 1;				
-		
-		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_trimmed(new pcl::PointCloud<pcl::PointXYZRGB>);				
-		point_cloud_trimmed->header = point_cloud->header;
-		point_cloud_trimmed->header.frame_id = "kitti_stereo";//l_image_msg->header.frame_id;
-		point_cloud_trimmed->width = 1;				
-			
-			
-		// message to point cloud conversion		
-		pcl::fromROSMsg(*points, *point_cloud);
-		
-		float camHeight = estimateDir->getCameraHeightFromRoad();
-		for(size_t i=0; i<point_cloud->size(); ++i){
-		
-			if(point_cloud->points[i].y < camHeight*0.5 && point_cloud->points[i].y >camHeight*0.5 - 0.5){
-				point_cloud_trimmed->push_back(point_cloud->points[i]);
-			}
-		}
-		
-		estimateDir->setPointCloud(point_cloud_trimmed);	
-			
-		point_cloud_grid->header = point_cloud->header;			
-	    point_cloud_grid->width = 1;	    		
-	
-		dirs.clear();
-		locs.clear();
-		gapEndPoints.clear();
-		
-		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints);							
-	
-    	estimateDir->getGridAsPointCloud(point_cloud_grid, false);		// with free space rendered
-	    estimateDir->renderPossibleDriveDirectionsOnGrid(point_cloud_grid, dirs, locs);
-	    
-    	
-		pub_point_cloud.publish(point_cloud_trimmed);
-		pub_grid_view.publish(point_cloud_grid);
-		publishDirections(dirs, locs, gapEndPoints, points->header, true, false, true);
-		// marker to be published here....
-	}
-}
-
-
-*/
-
-/*
-
-Listener listener;
-  ros::Subscriber sub = n.subscribe("chatter", 1000, &Listener::callback, &listener);
-
- rosbag play ~/Downloads/kitti_00.bag /kitti_stereo/left/image_rect:=/kitti_stereo/left/image_raw /kitti_stereo/right/image_rect:=/kitti_stereo/right/image_raw
- 
-  ROS_NAMESPACE=kitti_stereo rosrun stereo_image_proc stereo_image_proc stereo:=kitti_stereo image:=image_rect
-
-
- 
- */
-
-
-
-
-
-/* REMOVED CODES */
-
-/* updates the passed allDriveDir (as reference) vector with all possible
-// drive directions; it depends upon the availability of area> areaThres 
-void getDriveDirectionsBasedOnArea(const vector<int>& s, const vector<int>& e, float areaThres, float rmin, float rmax, vector<float>& dir){
-	
-	for(int i = 0; i<s.size(); ++i){
-	
-		float area = (((e[i] -s[i])*5)/float(360))*PI*(rmax*rmax - rmin*rmin);
-		//cout<<"+"<<i<<","<< (((e[i] -s[i])*5)/float(360))	<<endl;
-		if(area>=areaThres){
-			
-			dir.push_back( ((e[i] -s[i])*5) + s[i] );
-			cerr<<"++"<<((e[i] -s[i])*5) + s[i] <<endl;
-		}
-	}
-}
-
-
-
-
-float r = 0;
-		if(i!=0)
-			r = (binsMin[e[i]]+ binsMin[s[i]-1])/2;//? binsMin[e[i]] : binsMin[s[i]]; 
-		else
-			r = binsMin[e[i]];
-			
-			
-			
-			
-			
-			
-			
-*/
-
-
-
-
-
-/*// filter point cloud using PCL .... Dont break your head a lot...
-void publishSmoothedPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr pointsInPCLForm){
-
-	//pcl::PointCloud<pcl::PointXYZRGB>::Ptr pointsInPCLForm(new pcl::PointCloud<pcl::PointXYZRGB>);	
-	//pcl::fromROSMsg(*cloud, *pointsInPCLForm);
-
-	
-	// Create a KD-Tree
-  pcl::search::KdTree<pcl::PointXYZ>::Ptr tree (new pcl::search::KdTree<pcl::PointXYZ>);
-
-  // Output has the PointNormal type in order to store the normals calculated by MLS
-  pcl::PointCloud<pcl::PointNormal> mls_points;
-
-  // Init object (second point type is for the normals, even if unused)
-  pcl::MovingLeastSquares<pcl::PointXYZ, pcl::PointNormal> mls;
-  
-  mls.setComputeNormals (false);
-  
-  
-  //remove NAN values or u might get run time problems like:
-  
-  //build/pcl-1.7-K_Z193/pcl-1.7-1.7.1/kdtree/include/pcl/kdtree/impl/kdtree_flann.hpp:172: int pcl::KdTreeFLANN<PointT, Dist>::radiusSearch(const PointT&, double, std::vector<int>&, std::vector<float>&, unsigned int) const [with PointT = pcl::PointXYZRGB; Dist = flann::L2_Simple<float>]: Assertion `point_representation_->isValid (point) && "Invalid (NaN, Inf) point coordinates given to radiusSearch!"' failed.
-  
-  std::vector<int> indices;
-  pcl::removeNaNFromPointCloud(*pointsInPCLForm, *pointsInPCLForm, indices);
-  
-  // Set parameters
-  mls.setInputCloud (pointsInPCLForm);
-  mls.setPolynomialFit (true);
-  mls.setPolynomialOrder(1);
-  mls.setSearchMethod (tree);
-  mls.setSearchRadius (0.05);
-
-  // Reconstruct
-  mls.process (mls_points);
-  
-  		
-		pub.publish(mls_points);
-}
-*/
-
-/*
-// returns the normal of the most dominant plane. In this particular example, the most
-// dominant plane means ROAD plane
-pcl::PointXYZ getDominantPlaneNormal(const pcl::PointCloud<pcl::PointXYZRGB> pc){
-
-	float distBWPoints = 0.1;			//the points should atleast be 'distBWPoints' distant to each other
-	
-	int64_t sizeOfPointCloud = pc.size();
-	vector<pcl::PointXYZ> normals;		// to store the normals of the planar models 
-	
-	// to hold the indices of points for random sampling
-	vector<int64_t> randomIndices1, randomIndices2, randomIndices3;
-	for (int i=0;i<sizeOfPointCloud; ++i){
-		randomIndices1.push_back(i);
-		randomIndices2.push_back(i);
-		randomIndices3.push_back(i);				
-	} 
-	
-	// generate a random series of indices	
-	random_shuffle(randomIndices1.begin(), randomIndices1.end());
-	random_shuffle(randomIndices2.begin(), randomIndices2.end());
-	random_shuffle(randomIndices3.begin(), randomIndices3.end());
-		
-	Eigen::Vector3d p1, p2, p3,v1,v2, normal;
-
-	for(int i=0; i<sizeOfPointCloud; ++i){
-		
-		p1.x = pc[randomIndices1[i]].x; p1.y = pc[randomIndices1[i]].y; p1.z = pc[randomIndices1[i]].z;
-		p2.x = pc[randomIndices1[i]].x; p2.y = pc[randomIndices1[i]].y; p2.z = pc[randomIndices1[i]].z;
-		p3.x = pc[randomIndices1[i]].x; p3.y = pc[randomIndices1[i]].y; p3.z = pc[randomIndices1[i]].z;
-		
-		//check if the points aren't the same... later we will test for a minimum distance between the points to be selected
-		if ( sqrt( pow((p1.x - p2.x),2) + pow((p1.y - p2.y),2) + pow((p1.z - p2.z),2) ) > 0.0
-		          && sqrt( pow((p1.x - p3.x),2) + pow((p1.y - p3.y),2) + pow((p1.z - p3.z),2) ) >0.0 ){
-		               
-			v1.x = p1.x - p2.x;
-			v1.y = p1.y - p2.y;
-			v1.z = p1.z - p2.z;
-			
-			v2.x = p1.x - p3.x;
-			v2.y = p1.y - p3.y;
-			v2.z = p1.z - p3.z;
-			
-Eigen::Vector3f a;
-			//normals.push_back(v1^v2);	// taking cross product
-		}
-	}
-	
-}*/
-
-
-
-	/* publish the direction markers for possible drive directions 
-	
-		visualization_msgs::Marker marker;
-		marker.header.frame_id = pointsInPCLForm.header.frame_id;
-		marker.header.stamp = ros::Time::now();
-		marker.ns = "basics";
-		marker.id = 0;
-		marker.type = visualization_msgs::Marker::LINE_STRIP;
-		marker.action = visualization_msgs::Marker::ADD;
-
-		// construct the directions with line_strips 
-		
-	    geometry_msgs::Point p;	    
-	
-		p.x = 0;
-		p.y = 0;
-		p.z = 40;
-		marker.points.push_back(p);
-	    
-	    for(int i = 0; i<dir.size(); ++i){	
-	    	
-			p.x = 2*(cos(dir[i])/0.017);
-			p.y = 0;
-			p.z = 3*(sin(dir[i])/0.017);
-			marker.points.push_back(p);
-
-			p.x = 0;
-			p.y = 0;
-			p.z = 40;
-			marker.points.push_back(p);
-	    
-	    }
-		  
-		
-		marker.scale.x = 2;
-		marker.scale.y = 1;
-		marker.scale.z = 1;
-		
-		marker.color.b = 205;
-		marker.color.a = 1;
-		marker.lifetime = ros::Duration();
-		pubDriveDirection.publish(marker);
-	*/
-	
-
-
-
-
-
-/*
-
-// OLD DISPARITY TO POINT CLOUD FUNCTION
-
-void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
-                                 const CameraInfoConstPtr& l_info_msg,
-                                 const CameraInfoConstPtr& r_info_msg,
-                                 const DisparityImageConstPtr& disp_msg){
-	
-	cv_bridge::CvImageConstPtr cv_ptr, cv_ptr_d;
-    cv_ptr = cv_bridge::toCvShare(l_image_msg, sensor_msgs::image_encodings::RGB8);
-    cv_ptr_d = cv_bridge::toCvCopy(disp_msg->image, sensor_msgs::image_encodings::TYPE_32FC1);
-      
-	image_geometry::StereoCameraModel model;
-	model.fromCameraInfo(*l_info_msg, *r_info_msg);
-	pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-	
-	
-	point_cloud->header.frame_id = l_image_msg->header.frame_id;
-    point_cloud->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
-    point_cloud->width = 1;//point_cloud->frame_id = l_image_msg->frame_id;
-    
-	for(size_t i =cv_ptr_d->image.rows/2; i <=cv_ptr_d->image.rows; ++i){
-		for(size_t j =0; j <=cv_ptr_d->image.cols; ++j){
-			
-				
-				cv::Point3d point;	//
-				cv::Point2d px(j,i);
-				float disp = cv_ptr_d->image.at<float>(i,j);
-				model.projectDisparityTo3d(px, disp, point);
-				pcl::PointXYZ p;
-				// != image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z) 
-				if(point.y<0.65 && point.y>0 && point.z > 0 && point.z <10 &&  point.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z)){
-					p.x = point.x;
-					p.y = point.y;
-					p.z = point.z;													
-					point_cloud->points.push_back(p);
-				}
-				else{
-					float bad_point = std::numeric_limits<float>::quiet_NaN ();
-					p.x = p.y = p.z = bad_point;
-					
-				}
-				
-		}
-	}
-	
-    point_cloud->height = point_cloud->size();
-}
-
-*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
-
-
-//FROM SERVER
-
-
-void pointCloudFromDisparity(	 const ImageConstPtr& l_image_msg,
-                                 const CameraInfoConstPtr& l_info_msg,
-                                 const CameraInfoConstPtr& r_info_msg,
-                                 const DisparityImageConstPtr& disp_msg){
-	
-	cv_bridge::CvImageConstPtr cv_ptr, cv_ptr_d;
-    cv_ptr = cv_bridge::toCvShare(l_image_msg, sensor_msgs::image_encodings::RGB8);
-    cv_ptr_d = cv_bridge::toCvCopy(disp_msg->image, sensor_msgs::image_encodings::TYPE_32FC1);
-      
-	image_geometry::StereoCameraModel model;
-	model.fromCameraInfo(*l_info_msg, *r_info_msg);
-
-	// to store only the ground points	
-	pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-
- 	// to store the color coded point cloud	
-	pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_seg(new pcl::PointCloud<pcl::PointXYZRGB>);	
-	
-	point_cloud_seg->header.frame_id = "pcl";//l_image_msg->header.frame_id;
-    point_cloud_seg->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
-    point_cloud_seg->width = 1;
-
-	point_cloud->header.frame_id = "pcl";//l_image_msg->header.frame_id;
-    point_cloud->header.stamp = pcl_conversions::toPCL(l_info_msg->header).stamp;
-    point_cloud->width = 1;//point_cloud->frame_id = l_image_msg->frame_id;
-    
-	for(size_t i =cv_ptr_d->image.rows/2; i <=cv_ptr_d->image.rows; ++i){
-		for(size_t j =0; j <=cv_ptr_d->image.cols; ++j){
-			
-				
-				cv::Point3d point;	//
-				cv::Point2d px(j,i);
-				float disp = cv_ptr_d->image.at<float>(i,j);
-				model.projectDisparityTo3d(px, disp, point);
-				pcl::PointXYZRGB p;
-				// != image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z) 
-				if(point.y >0 && point.z > 0 && point.z<15 &&  point.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(point.z)){
-
-					p.x = point.x;
-					p.y = point.y;
-					p.z = point.z;				       
-					
-					point_cloud->push_back(p);
-				}
-				
-				
-		}
-	}
-
-    for(size_t i = 0; i<point_cloud->size(); ++i){
-		if(point_cloud->points[i].y>1.45 &&  point_cloud->points[i].x>-1.2 && point_cloud->points[i].x<1.2 && point_cloud->points[i].z<5){
-			point_cloud_seg->push_back(point_cloud->points[i]);
-		
-		}	
-    }	
-//cerr<<"herer"<<__LINE__<<endl;
-
-    // rememeber when you mess up with the size of cloud buffer: u get exception like:
-   //     terminate called after throwing an instance of 'ros::serialization::StreamOverrunException'... 	
-//    point_cloud_seg->height = point_cloud_seg->size();
-//    point_cloud->height = point_cloud->size();
-//cerr<<"herer"<<__LINE__<<endl;
-
-    getPlaneParameters(point_cloud_seg);
-
-     // - clear the points in point_cloud_seg as we dont need it any more.. use this to load the above the ground ponts
-   point_cloud_seg->clear();		
-
-     // change the color of plane and obstacle points
-
-// cerr<<"herer"<<__LINE__<<" "<<point_cloud->size()<<"seg "<<endl;//point_cloud_seg<<endl;
-
-    for(size_t i=0; i<point_cloud->size(); ++i){
-		
-        pcl::PointXYZRGB p = point_cloud->points[i];
-	float planeFitErr = PNa*p.x + PNb*p.y + PNc*p.z + PNd;
-	//cerr<<"Plane FItt error"<<planeFitErr<<endl;
-	if(planeFitErr >0.25){	//0.15, plan - 0.04, z<5, y>1.45
-		point_cloud->points[i].r = 200;
-		
-		//also make a cloud of obstacle points
-		if(point_cloud->points[i].z > 2 && point_cloud->points[i].y>0.4)
-			point_cloud_seg->push_back(point_cloud->points[i]);
-	}
-	else
-		point_cloud->points[i].g = 200;
-	
-    }		
-
-    //pub.publish(point_cloud);
-    //occupancy_above_ground(point_cloud_seg);
-
-}
-
-*/
-
-
-
-//point_cloud_seg->clear();
-    //estimateDir.getObstaclesPoints(point_cloud_seg);
-    /*
-    pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor;
-  	sor.setInputCloud (point_cloud_new);
-  	sor.setMeanK (100);
-  	sor.setStddevMulThresh (1.5);
-  	sor.filter (*point_cloud_seg);
-	*/
-    
-    
-    //occupancy_above_ground(point_cloud_seg);
-    //estimateDir.renderPossibleDriveDirectionsOnGrid(point_cloud_seg, dirs, locs);
-    //estimateDir.printAngularOccupancy();
-	//cerr<<"^";
-    //for(int i=0; i<dirs.size(); ++i)
-    	//cerr<<dirs[i]<<",";
-    //publish   
-    //cerr<<endl;
-    //pub_counter++;
-    
-    //if(pub_counter%10 == 0)
-    
-    
-    //************************************GENREATING MARKERS *************************************//
-    
-    
-    /*	visualization_msgs::Marker marker;
-    	visualization_msgs::MarkerArray marker_array_msg;
-    	
-    	marker_array_msg.markers.resize(dirs.size());
-
-		// construct the arrow markers and push it in the marker array for all drivable directions 		
-		
-		for(int i=0; i<dirs.size(); ++i){
-		
-			marker_array_msg.markers[i].header.frame_id = point_cloud->header.frame_id;
-			marker_array_msg.markers[i].header.stamp = l_info_msg->header.stamp;
-			marker_array_msg.markers[i].ns = "kitti_stereo";
-			marker_array_msg.markers[i].id = 0;
-			marker_array_msg.markers[i].type = visualization_msgs::Marker::ARROW;
-			marker_array_msg.markers[i].action = visualization_msgs::Marker::ADD;
-		
-			geometry_msgs::Point p;	    
-			
-			p.x = 0;
-			p.y = -2;
-			p.z = 0;
-			marker_array_msg.markers[i].points.push_back(p);
-	    	    	
-			p.x = 2 * cos( estimateDir.toRadian(dirs[i]) );
-			p.y = -2;
-			p.z = 2 * sin( estimateDir.toRadian(dirs[i]) ) ;
-			marker_array_msg.markers[i].points.push_back(p);
-
-			marker_array_msg.markers[i].color.b = 205;
-			marker_array_msg.markers[i].color.a = 1;
-			marker_array_msg.markers[i].lifetime = ros::Duration();
-	    	marker_array_msg.markers[i].scale.x = 12;
-			marker_array_msg.markers[i].scale.y = 11;
-	    	marker_array_msg.markers[i].scale.z = 11;
-		
-	    }
-		  
-		
-	//	marker.scale.x = 2;
-	//	marker.scale.y = 1;
-	//	marker.scale.z = 1;
-		*/
-		
-
-//		marker.header.stamp.nsec = (point_cloud->header.stamp)*1000; //ros::Time::now();
-/***************			
-		visualization_msgs::Marker marker;
-		marker.header.frame_id = point_cloud->header.frame_id;
-		marker.header.stamp = l_info_msg->header.stamp;
-	
-		marker.id = 0;
-		marker.type = visualization_msgs::Marker::LINE_STRIP;
-		marker.action = visualization_msgs::Marker::ADD;
-
-		// construct the directions with line_strips 
-		
-	    geometry_msgs::Point p;	    
-	
-		p.x = 0;
-		p.y = 0;
-		p.z = 0;
-		marker.points.push_back(p);
-	    
-	    for(int i = 0; i<dirs.size(); ++i){	
-	    	
-			p.x = 2 * cos(estimateDir.toRadian(dirs[i])) ;
-			p.y = 0;
-			p.z = 2 * sin(estimateDir.toRadian(dirs[i]));
-			marker.points.push_back(p);
-
-			p.x = 0;
-			p.y = 0;
-			p.z = 0;
-			marker.points.push_back(p);
-	    
-	    }
-		  
-		
-		marker.scale.x = 0.1;
-		marker.scale.y = 0.2;
-		marker.scale.z = 4;
-		
-		marker.color.b = 205;
-		marker.color.a = 1;
-		marker.lifetime = ros::Duration();
-		
-		
-		
-    //*********************************************************************************************/	
 
 
 
