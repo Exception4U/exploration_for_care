@@ -737,7 +737,7 @@ class ExploreDirectionEstimator{
 			nh->setParam("grid_center_x", 50);
 			nh->setParam("grid_center_z", 0);
 			nh->setParam("obstacle_segmentation_method", 0);	//0 - height based, 1- plane based
-			nh->setParam("min_height_for_obstacles",0.6);		// anthing above this is an obstacle - used only for height based segment.
+			nh->setParam("min_height_for_obstacles",0.75);		// anthing above this is an obstacle - used only for height based segment.
 			
 			printAllParameters();
 		}
@@ -1376,11 +1376,11 @@ int main(int argc, char **argv){
 	n->setParam("max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);
 	n->setParam("min_Z", 1.5);
 	n->setParam("max_Y", -1.0);
-	n->setParam("marker_z_position_offset",0);
+	n->setParam("marker_z_position_offset",-0.1);
 	n->setParam("input_mode", 1);	//0-means use disparity, 1- use point cloud
 	
 	
-	printf("%32s - %f\n","marker_z_position_offset",0.0);
+	printf("%32s - %f\n","marker_z_position_offset",-0.1);
 	printf("%32s - %f\n","max_Z_for_plane_fitting", 10.0);			
 	printf("%32s - %f\n","max_X_for_plane_fitting", 1.0);		
 	printf("%32s - %f\n","max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);			
@@ -1388,17 +1388,17 @@ int main(int argc, char **argv){
 	printf("%32s - %f\n","max_Y", -1.0);
 	printf("%32s - %i\n","input_method", 1);	
 
-	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/camera/left/image_rect", 10);
-	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/camera/disparity", 10);
-	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/camera/left/camera_info", 10);
-	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/camera/right/camera_info", 10);   
+	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/stereo_camera/left/image_rect", 10);
+	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/stereo_camera/disparity", 10);
+	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/stereo_camera/left/camera_info_throttle", 10);
+	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/stereo_camera/right/camera_info_throttle", 10);
 
 	typedef sync_policies::ApproximateTime<Image, CameraInfo, CameraInfo, DisparityImage> myApprxSyncPolicy;
 	
 	Synchronizer<myApprxSyncPolicy> sync(myApprxSyncPolicy(10), sub_l_img, sub_l_info,sub_r_info, sub_disp_img);
 	sync.registerCallback(boost::bind(computeDirectionsFromDisparity, _1, _2,_3,_4));
 
-	ros::Subscriber sub_point_cloud = n->subscribe("/camera/points2/", 10, computeDirectionsFromPointCloud);
+	ros::Subscriber sub_point_cloud = n->subscribe("/stereo_camera/points2", 10, computeDirectionsFromPointCloud);
 
     //sub = nh.subscribe("/camera/points2", 100, pointCloudFromDisparity);  
 	pub_point_cloud = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("incoming_point_cloud", 1);
