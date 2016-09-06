@@ -1,47 +1,4 @@
 
-/*	
-
-	EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
-	---------------------------------------------------
-	
-	Author - Junaid Ahmed Ansari
-	email  - ansariahmedjunaid@gmail.com
-	Inst.  - IIIT Hyderabad
-	
-	Description - This node estimates all possible safe driveable directions for a robot given a disparity image. The safety is governed by
-				  the availability of enough gap width which can be set dynamically (see ExploreDirectionEstimator::setupParameters() ).
-				  
-				  Important features:
-					  - Road plane segmentation based on RANSAC (pcl plane fitting used) and hence obstacle segmentation  
-					  - genrates possible driveable directions for the vehicle based on available gap
-					  - generates grid map (not probabilistic)
-				  
-				  Subscribes To:
-				  	  - /(namespace)/left/camera_info
-				  	  - /(namespace)/right/camera_info
-				  	  - /(namespace)/disparity
-				  	  - /(namespace)/left/image_rect
-				  	  
-				  publishes
-				  	  - /explore/ground_points
-				  	  - /explore/obstacle_points
-				  	  - /explore/grid_view 
-				  	  - /explore/incomming_point_cloud (if coloring set...it is colored based on segmentation)
-				  	  - /explore/drive_directions	(markers for drive direction)
-				  	  - /explore/gap_marks (gaps are drawn as lines in green color)		
-				  	  - /explore/direction_as_poses (drive directions as PoseArray msg - position - gapcenterpos, orientation - direction)
-				  	  
-				  	  
-	Note - More info on parameters to be here soon....				  								  
-	
-	To Do - publish a range of directions for ever gap so that the PLANNER node can decide upon which is most suitable		
-		  - Write callback for param change
-		  - when there is no plane fo fitting, keep the previous values of parameters
-		  - parameter for overriding marker height 
-		  - provide parameter for angle rejection
-	
-*/
-
 #include <ros/ros.h>
 #include <sensor_msgs/image_encodings.h>
 #include <sensor_msgs/PointCloud.h>
@@ -50,6 +7,7 @@
 //#include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
 #include <visualization_msgs/MarkerArray.h>
@@ -96,13 +54,15 @@ ros::Publisher pub_grid_view;			//		      grid view with possible drive directio
 ros::Publisher pubDriveDirectionGlobal;	//			  possible drive directions as marker array in global frame
 ros::Publisher pub_obstacle_points;
 ros::Publisher pubGapMarkersGlobal;		// publish gap markers
+ros::Publisher pubDriveDirectionGlobalFiltered;		// publish gap markers
+
 ros::Publisher pubDriveDirectionAsPoses;
 ros::Publisher pubFreeSpaceMarker;
 int inputMode = 0;	// 0-disparity 1-point cloud
 
 ros::NodeHandle *n;
 
-vector<float> dirs;
+vector<float> dirs,consistentDirs,prevDirs;
 vector<cv::Point2f> locs;		
 vector<cv::Vec4f> gapEndPoints;					// gap end points.... (0,1) - (x1, y1) (2,3) - (x2,y2)
 
@@ -332,14 +292,16 @@ class ExploreDirectionEstimator{
 		// possibleDriveDirections   - vector of all possible drivable directions in degrees
 		// possibleDriveGapLocations - center location of the driveable gaps
 		// possiblegap endpoints - gap endpoints
-		bool getDriveDirectionsBasedOnGapWidth(vector<float>& possibleDriveDirections, vector<cv::Point2f>& possibleDriveGapLocations, vector<cv::Vec4f>& possibleGapEndPoints){
-		
+		bool getDriveDirectionsBasedOnGapWidth(vector<float>& possibleDriveDirections, vector<cv::Point2f>& possibleDriveGapLocations, vector<cv::Vec4f>& possibleGapEndPoints, bool dynamicMaxRho = false){
 		
 			if(inputCloud->size() >0){		
 			
-				processCloud();
-				getGaps();	
-	
+				if(dynamicMaxRho)
+					processCloudWithDynamicMaxRho();
+			    else
+			    	processCloud();
+			    getGaps();
+
 				for(int i = 0; i<gapsInAngularOccupancyStartInd.size(); ++i){								
 				
 					int s = gapsInAngularOccupancyStartInd[i];
@@ -394,12 +356,16 @@ class ExploreDirectionEstimator{
 		// this interface does every thing, process pnt cld, get occupancies, and compute drive directions and gap locations
 		// possibleDriveDirections   - vector of all possible drivable directions in degrees
 		// possibleDriveGapLocations - center location of the driveable gaps
-		bool getDriveDirectionsBasedOnGapWidth(vector<float>& possibleDriveDirections, vector<cv::Point2f>& possibleDriveGapLocations){
+		bool getDriveDirectionsBasedOnGapWidth(vector<float>& possibleDriveDirections, vector<cv::Point2f>& possibleDriveGapLocations, bool dynamicMaxRho = true){
 		
 		
 			if(inputCloud->size() >0){		
 			
-				processCloud();
+				if(dynamicMaxRho)
+					processCloudWithDynamicMaxRho();
+			    else
+			    	processCloud();
+
 				getGaps();	
 	
 				for(int i = 0; i<gapsInAngularOccupancyStartInd.size(); ++i){								
@@ -718,15 +684,75 @@ class ExploreDirectionEstimator{
 				printf("%32s - %f\n","min_height_for_obstacles",minHeightOfObstacle);
 		}
 		
+
+		// it returns a vector of points(x,y,z) which correspond to the co-ordinates of the obstacle seen in every bin
+		// of the angular occupancy ... It can be used to render the available free space in front of the robot
+		void getFreeSpaceEndPoints(vector<cv::Point3f>& freeSpaceEP){
+
+			int binsToLeave = int(angleOffset/angularOccupancyResolution);
+			int binCntr = 0 + binsToLeave;
+			cv::Point3f p;
+
+
+
+			for(int i = binsToLeave; i<(angularOccupancy.size()-binsToLeave); ++i){
+
+				p.x = angularOccupancyRho[i]*cos(toRadian(i*angularOccupancyResolution));
+				p.z = angularOccupancyRho[i]*sin(toRadian(i*angularOccupancyResolution));
+
+				if(obstacleSegMethod == 0)
+					p.y = minHeightOfObstacle;
+				else
+					p.y = roadPlaneParameters[3]-groundTolerance;
+
+
+				freeSpaceEP.push_back(p) ;
+			}
+		}
+
+
+		// generates the range of direction in degree available for every safe gap .. This is helpful for smoothing direction
+		// by checking the previous directions in the range of current gap endpoints and also can be used by planner in future
+		// note: calculations are done with the convention that endpoints are recored from right to left
+		void getDirectionRange(const vector<cv::Vec4f>& gapEndPoints, vector<cv::Vec2f>& dirRange, float safeDistOnEachSide){
+
+
+			for( int i = 0; i < gapEndPoints.size(); ++i){
+
+				float theta1 = atan2( (gapEndPoints[i])[1], (gapEndPoints[i])[0] );
+				float theta2 = atan2( (gapEndPoints[i])[3], (gapEndPoints[i])[2] );
+				float phi = fabs(theta1-theta2);
+
+				float d1 = sqrt( pow((gapEndPoints[i])[0],2) + pow((gapEndPoints[i])[1],2)  );
+				float d2 = sqrt( pow((gapEndPoints[i])[2],2) + pow((gapEndPoints[i])[3],2)  );
+
+				// angles to avoid from both side of endpoints
+				float thetaDanger1 = safeDistOnEachSide/d1;
+				float thetaDanger2 = safeDistOnEachSide/d2;
+
+				float angleRangeMin = theta1 + thetaDanger1;
+				float angleRangeMax = theta2 - thetaDanger2;
+
+				cv::Vec2f range;
+				range[0] = toDegree(angleRangeMin);
+				range[1] = toDegree(angleRangeMax);
+				cerr<<i<<"--"<<range<<endl;
+				dirRange.push_back(range);
+
+			}
+			cerr<<endl;
+		}
+
+
 	private:
 	
 		// sets up parameters for dynamic change using "rosparam set" command
 		void setupParameters(){
 		
-			nh->setParam("load_params",true);		// flag to load parameters from server in to the node	
+			nh->setParam("load_params",true);			// flag to load parameters from server in to the node
 			nh->setParam("ground_tol", 0.06);			// tolerance for extracting ground
 			nh->setParam("obstacle_tol", 0.215);		// tolerance for extracting obstacle
-			nh->setParam("grid_size", 101);			// grid size
+			nh->setParam("grid_size", 101);				// grid size
 			nh->setParam("cam_height", 0.9);
 			nh->setParam("angular_occupancy_max_rho", 5.5);
 			nh->setParam("angular_occupancy_angle_offset", 35);
@@ -737,7 +763,7 @@ class ExploreDirectionEstimator{
 			nh->setParam("grid_center_x", 50);
 			nh->setParam("grid_center_z", 0);
 			nh->setParam("obstacle_segmentation_method", 0);	//0 - height based, 1- plane based
-			nh->setParam("min_height_for_obstacles",0.75);		// anthing above this is an obstacle - used only for height based segment.
+			nh->setParam("min_height_for_obstacles",0.6);		// anthing above this is an obstacle - used only for height based segment.
 			
 			printAllParameters();
 		}
@@ -756,6 +782,8 @@ class ExploreDirectionEstimator{
 		// bins all in one loop
 		void processCloud(){
 		
+			float minObstacleDist = sizeOfGrid*gridUnit;
+
 			//on every iteration make+inititalize grid to make sure that grid is cleared and if size has changed then it is allocated accordingly
 			makeGrid();
 			grid.setTo(cv::Scalar(0));
@@ -782,7 +810,7 @@ class ExploreDirectionEstimator{
 				    }
 					//translate the points
 					double tr_x = x + centerOfGridInX*gridUnit;	
-					double tr_z = z + centerOfGridInZ*gridUnit;	;//-=------------
+					double tr_z = z + centerOfGridInZ*gridUnit;
 			
 					// mark grid to be occupied i.e. 1;				
 					int gridXLoc = 0, gridZLoc = 0;
@@ -813,6 +841,7 @@ class ExploreDirectionEstimator{
 						float dist = sqrt(x*x + z*z);
 						int angleBin = 0;
 						 
+
 						if(x!=0.0){	
 							angleBin = toDegree(atan(z/x))/angularOccupancyResolution;
 							// cerr<<x<<","<<z<<"," << "*"<<(atan(z/x)/0.017)<<endl;
@@ -849,7 +878,135 @@ class ExploreDirectionEstimator{
 			}//end for loop
 			
 		}//end func
+
 		
+		// this  ses the cloud and generates OccupancyGrid (not probabilistic as of now) and angular Occupancy
+		// bins all in one loop
+		void processCloudWithDynamicMaxRho(){
+
+			float minObstacleDist = sizeOfGrid*gridUnit;
+
+			//on every iteration make+inititalize grid to make sure that grid is cleared and if size has changed then it is allocated accordingly
+			makeGrid();
+			grid.setTo(cv::Scalar(0));
+
+			for(size_t i = 0; i<inputCloud->size(); ++i){
+
+				float x = inputCloud->points[i].x;
+				float z = inputCloud->points[i].z;
+				float y = inputCloud->points[i].y;
+				cv::Point3f p(x,y,z);
+				// process the points i.e. make grid/make angular occupancies if and only if they are obstacles
+				if( (obstacleSegMethod == 1 && isObstacle(p)) || (obstacleSegMethod == 0 && isObstacleByHeight(p,minHeightOfObstacle)) ){
+
+					// coloring enabled
+				    if(colorPointCloud){
+				    	inputCloud->points[i].r = 200;
+				    	inputCloud->points[i].g = 0;
+				    	inputCloud->points[i].b = 0;
+				    }
+					//translate the points
+					double tr_x = x + centerOfGridInX*gridUnit;
+					double tr_z = z + centerOfGridInZ*gridUnit;
+
+					// mark grid to be occupied i.e. 1;
+					int gridXLoc = 0, gridZLoc = 0;
+
+					// scale the location of points to the grid location
+					if(tr_x >0)
+						gridXLoc = int(tr_x / gridUnit);
+					if(tr_z >0)
+						gridZLoc = int(tr_z / gridUnit);
+
+					// update occupancy and angular occupancy in one go
+					if(gridXLoc <sizeOfGrid && gridZLoc < sizeOfGrid) {
+
+						//rowxcol i.e. ZxX
+						grid.at<uchar>(gridZLoc,gridXLoc) = 1;			//uchar is openCV defined for CV_8UC1
+
+						// tralslate the grid locations wrt center
+						float z = gridZLoc - centerOfGridInZ;
+						float x = gridXLoc - centerOfGridInX;
+
+						// converting points to meter units as the grid is in units of 10cm
+						x = x*0.1;
+						z = z*0.1;
+
+						// distance to the grid location from center
+						float dist = sqrt(x*x + z*z);
+
+						if(dist<minObstacleDist)
+							minObstacleDist = dist;
+
+					}//end update_occupancy if
+
+
+				}//end isObstacle cond
+				else{
+				    if(colorPointCloud){
+				    	inputCloud->points[i].r = 0;
+				    	inputCloud->points[i].g = 200;
+				    	inputCloud->points[i].b = 0;
+				    }
+				}
+
+			}//end for loop
+
+			for(int i=0; i<angularOccupancy.size(); ++i){
+				angularOccupancy[i] = 0;
+				angularOccupancyRho[i] = angularOccupancyMaxRho;//minObstacleDist+0.1;
+			}
+
+			//generate angular occupancy with dynamic max rho
+			for(long int i = 0; i<sizeOfGrid; ++i){	//z
+				for(long int j=0; j<sizeOfGrid; ++j){	//x
+
+					if(grid.at<uchar>(i,j) == 1){		// minObstacleDist + 1 meter just as tolerance
+
+						// tralslate the grid locations wrt center
+						float z = i - centerOfGridInZ;
+						float x = j - centerOfGridInX;
+
+						// converting points to meter units as the grid is in units of 10cm
+						x = x*0.1;
+						z = z*0.1;
+						// distance to the grid location from center
+
+						float dist = sqrt(x*x + z*z);
+						int angleBin = 0;
+
+
+						if(x!=0.0){
+							angleBin = toDegree(atan(z/x))/angularOccupancyResolution;
+							// cerr<<x<<","<<z<<"," << "*"<<(atan(z/x)/0.017)<<endl;
+						}
+						else{
+
+							angleBin = numOfAngularOccupancyBins/2;	// which means 90 degrees i.e. center of the bins
+
+						}
+
+						if(angleBin < 0)
+							angleBin = numOfAngularOccupancyBins+angleBin;
+
+//						cerr<<"["<<i<<"-"<<j<<"-"<<int(j)-centerOfGridInX<<":"<<z<<":"<<"="<<dist<<"]";
+						if(dist <= angularOccupancyMaxRho/*(minObstacleDist+0.1)*/ && dist < angularOccupancyRho[angleBin]){
+							angularOccupancy[angleBin] = 1;
+							angularOccupancyRho[angleBin] = dist;	// put new Min for that angle value
+
+						}
+
+					}
+
+				}
+			}
+			printAngularOccupancy();
+			cerr<<"minDist - "<<minObstacleDist<<endl;
+
+		}//end func
+
+
+
 	
 		// generates the start and end indices of the gaps in the angular occupancy bins and stores them in the 
 		// vectors gapsInAngularOccupancyStartInd and gapsInAngularOccupancyEndInd
@@ -938,6 +1095,7 @@ class ExploreDirectionEstimator{
 		float minHeightOfObstacle;						// used in just height based obstacle segmentation
 
 		
+		float closestObstacleDist;					// the distance to the closest obstacle
 };
 
 	
@@ -955,15 +1113,179 @@ float maxYforPlaneFit;
 float minZ,maxY;
 float markerPosOffset;
 
+vector<cv::Point3f> freeSpaceEndPoints;
+vector<vector<float> > directionsBuffer;		// this stores the directions computed in different frames.
+int numOfFramesForConsistencyCheck=3;
+int numOfFramesBuffered=0;						// this is used to see wether enough no. of frames have been buffered to start direction filtering
+
+
+vector<vector<float> > consistentDirBuffer;
+int consistentDirCnt = 0;
+
+// generates consistend directions when given a vector of vector of directions. It returns true if there were any consisten directions
+// else it returns false
+// actionInNoDir - means what should be done when non are consistent. 0 - do nothing, 1-strainght i.e. 90deg, else it is left to previous
+bool getConsistentDirections(const vector<vector<float> >& frames, vector<float>& consistentDirs, int consistencyThres, float angleTol, bool avg=true, int actionInNoDir= 0){
+
+
+		for(int i=0;i<frames.size(); ++i){
+			cerr<<"+--"<<i<<"--";
+			for(int j=0;j<frames[i].size(); ++j){
+				cerr<<(frames[i])[j]<<" ";
+			}
+			cerr<<endl;
+		}
+		cerr<<endl;
+
+	int numOfFrames = frames.size();
+	bool dirChange= false;
+	cerr<<"size getCons - "<<frames.size()<<endl;
+	vector<short> count;
+	vector<float> total(frames[numOfFrames-1].size(),0);
+
+	for(int i=0; i<frames[numOfFrames-1].size(); ++i){
+		int cnt = 0;
+		float dir = (frames[numOfFrames-1])[i];
+		total[i] += dir;
+		for(int j=0; j<=frames.size()-2; j++){
+
+			for(int k = 0; k<(frames[j]).size(); ++k){
+				if( fabs((frames[j])[k] - dir) <= angleTol ){
+					cnt++;
+					if(avg)
+						total[i] += (frames[j])[k];
+				}
+			}
+		}
+
+		// if atleast one is consistent
+		if(cnt+1>=consistencyThres)
+			dirChange = true;
+
+		count.push_back(cnt+1);
+		if(avg)
+			total[i]/=count[i];
+
+	}
+
+
+	if(dirChange){
+		consistentDirs.clear();
+
+		for(int i=0;i<frames[numOfFrames-1].size(); ++i){
+
+			if(count[i] >= consistencyThres){
+				if(avg)
+					consistentDirs.push_back(ceil(total[i]/10)*10);
+				else
+					consistentDirs.push_back(ceil((frames[numOfFrames-1])[i]/10)*10 );
+
+				dirChange = true;
+			}
+			cout<<(frames[numOfFrames-1])[i]<<" -- "<<count[i]<<" -- "<<total[i]<<endl;
+		}
+	}
+	else{
+		if(actionInNoDir == 0)
+			consistentDirs.clear();
+		else if(actionInNoDir == 1){
+			consistentDirs.clear();
+			consistentDirs.push_back(90.5);
+		}
+	}
+
+
+	cout<<endl<<"----------------------"<<endl;
+
+	return dirChange;
+
+}
+
+
+// filters the directions which are not suitable to travers based on the gap orientation
+// NOTE - later we have to introduce parameters governing this rejection
+void filterInappropriateDirections(const vector<float>& dirs, vector<cv::Vec4f>& gapEndPoints, vector<float>& filteredDir){
+
+	vector<cv::Vec4f> gapEndPointsF;
+	for(int i=0; i<dirs.size(); ++i){
+
+		//if(dirs[i] >= 50 && dirs[i] <= 140){
+
+				 float y = (gapEndPoints[i])[1]-(gapEndPoints[i])[3];
+				 float x = (gapEndPoints[i])[0]-(gapEndPoints[i])[2];
+				 float slope = estimateDir->toDegree(atan2(y,x));
+
+				 if(y<0)
+				 	slope = slope+180;
+
+				if(dirs[i] <90 && (slope<25 || slope>110)){
+					filteredDir.push_back(dirs[i]);
+					gapEndPointsF.push_back(gapEndPoints[i]);
+				}
+
+				else if(dirs[i] >90 && (slope<80 || slope>155)){
+					filteredDir.push_back(dirs[i]);
+					gapEndPointsF.push_back(gapEndPoints[i]);
+				}
+
+		//}
+
+		/*else{
+
+			filteredDir.push_back(dirs[i]);
+			gapEndPointsF.push_back(gapEndPoints[i]);
+		}*/
+
+
+	}
+
+	gapEndPoints.clear();
+	gapEndPoints = gapEndPointsF;
+
+}
+
+// this functions checks wether the previous directions lie in the range of safe directions of the current gap endpoints. If so then
+// there is no need to change any direction rather previous one replaces the new one and hence direction response is smooth
+// Also, it gives 90 degrees to direction when ever possible so that vehicle can keep going straight if possible
+void smoothDirections(const vector<float>& prevDir, vector<float>& currDir, const vector<cv::Vec4f>& currGapEndPoints, float safeDistOnEachSide=0.5){
+
+	//get the angle range for the gap endpoints
+	vector<cv::Vec2f> dirRange;
+	estimateDir->getDirectionRange(currGapEndPoints, dirRange, safeDistOnEachSide);
+
+	// check all previous directions
+	for(int i = 0; i <prevDir.size(); ++i){
+
+		// look in all current angle ranges
+		for(int j=0; j<dirRange.size(); ++j){
+			//if the previous direction is in one of the gapendpoint angle range then replace the current with previous
+			if(prevDir[i]<=(dirRange[j])[1] && prevDir[i]>=(dirRange[j])[0] )
+				currDir[j] = prevDir[i];
+		}
+	}
+
+	// wherever possible make it 90
+	//surely we can do a better job..but i dont have time so to quickly finish it i am writting another loop...else we can maybe accomodate it in the above loop
+
+	for(int i=0; i<currDir.size(); ++i){
+
+		if( (dirRange[i])[0] < 90 && (dirRange[i])[1] > 90) //last condition added to avoid setting of 90 if the direction is too off 90 despite 90 being available
+			currDir[i] = 90;
+	}
+}
+
+
+
 // publish drive direction markers--BadDirs mean those direction which might not be appropriate inspite of availability of safe drivable
 // gap in that directions..mostly because of to sharp turning required...
 // gapMark means a line being drawn in the gap of drivable gap
 // connectGap means connect the center and gap center while publishing the marker
-void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& locs, const vector<cv::Vec4f>& gapEndPoints, std_msgs::Header h, bool publishGapMark = false, bool connectToGap = false, bool rejectBadDirs = false){		
+void publishDirections(const vector<float>& dirs, const vector<float>& consistentDirs, const vector<cv::Point2f>& locs, const vector<cv::Vec4f>& gapEndPoints, std_msgs::Header h, bool publishGapMark = false, bool connectToGap = false){
 		
 		visualization_msgs::Marker marker;
 		visualization_msgs::Marker gapMarker;	
 		visualization_msgs::Marker freeSpace;
+		visualization_msgs::Marker filteredDirections;
 		
 		geometry_msgs::PoseArray markerDirectinosAsPoses;
 		geometry_msgs::Pose poseOfMarker;
@@ -998,55 +1320,27 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 			gapMarker.type = visualization_msgs::Marker::LINE_LIST;
 			gapMarker.action = visualization_msgs::Marker::ADD;
 		}
-		
-	
-			freeSpace.header = h;
-			freeSpace.ns="gap_markers";
-			freeSpace.id = 0;
-			freeSpace.type = visualization_msgs::Marker::TRIANGLE_LIST;
-			freeSpace.action = visualization_msgs::Marker::ADD;
-		
 
 		// construct the directions with line_list 		
 	    geometry_msgs::Point p;	    
-	
-	    for(int i = 0; i<dirs.size(); ++i){										
-			
-			//check for inappropriate direction and if required reject them
-			if(rejectBadDirs){
-					
-					if(dirs[i] >50 && dirs[i] < 140){										
+		vector<float> passedDirs;
+	    for(int i = 0; i<consistentDirs.size(); ++i){
 						
-						// avoid divide by zero issue .. OR rather avoid for 90 deg dir
-						if( (gapEndPoints[i])[0] != (gapEndPoints[i])[2] ){
-						
-							 float perpGapDir= estimateDir->toDegree(atan( abs((gapEndPoints[i])[1]-(gapEndPoints[i])[3]) / abs((gapEndPoints[i])[0]-(gapEndPoints[i])[2]) ) );      							 
-							 //reject perpendicular dir below certain threshold 
-							 if(90-perpGapDir < 40) 				// note: a vertical gap in Z has 90-perpGapDir = 0
-							 	continue;	//skip this drive direction 
-						}
-					}
-					
-			}
-			
-			//make free space using triangle list
-			p.x = p.z = 0;
-			p.y = markerHeight;
-			freeSpace.points.push_back(p);
+			passedDirs.push_back(dirs[i]);
 			
 			// make gap markers 			
 			p.x = (gapEndPoints[i])[0];
 			p.z = (gapEndPoints[i])[1];
 			p.y = markerHeight;
 			gapMarker.points.push_back(p);
-			freeSpace.points.push_back(p);
+
 			// make gap markers
 			p.x = (gapEndPoints[i])[2];
 			p.z = (gapEndPoints[i])[3];
 			p.y = markerHeight;
 			gapMarker.points.push_back(p);
-			freeSpace.points.push_back(p);												
-			
+
+			cerr<<"gap"<<gapEndPoints[i]<<endl;
 			freeSpace.scale.x = 1;
 			freeSpace.scale.y = 1;
 			freeSpace.scale.z = 1;
@@ -1060,10 +1354,16 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 			marker.points.push_back(p);
 			
 			if(!connectToGap){
-				// to direction				    	
-				p.x = 2 * cos(estimateDir->toRadian(dirs[i])) ;
+				// to direction
+				float ang = dirs[i];
+/*				if(dirs[i]>90)
+					ang = ceil((dirs[i])/10)*10;
+				else
+					ang = floor((dirs[i])/10)*10; */
+
+				p.x = 2 * cos(estimateDir->toRadian( ang )) ;
 				p.y = markerHeight;
-				p.z = 2 * sin(estimateDir->toRadian(dirs[i])) ;
+				p.z = 2 * sin(estimateDir->toRadian( ang )) ;
 				marker.points.push_back(p);
 	    	}
 	    	else{
@@ -1090,7 +1390,7 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 		marker.scale.y = 0.1;
 		marker.scale.z = 1;
 		
-		marker.color.b = 205;
+		marker.color.g = 205;
 		marker.color.a = 1;
 		marker.lifetime = ros::Duration();
 		pubDriveDirectionGlobal.publish(marker);
@@ -1108,7 +1408,91 @@ void publishDirections(const vector<float>& dirs, const vector<cv::Point2f>& loc
 		}
 						
 		pubDriveDirectionAsPoses.publish(markerDirectinosAsPoses);
+
+
+		//make free space using triangle list
+
+		freeSpace.header = h;
+		freeSpace.ns="gap_markers";
+		freeSpace.id = 0;
+		freeSpace.type = visualization_msgs::Marker::TRIANGLE_LIST;
+		freeSpace.action = visualization_msgs::Marker::ADD;
+
+		for(int i=0; i<freeSpaceEndPoints.size()-1; ++i){
+			p.x = p.z = 0;
+			p.y = markerHeight;
+			freeSpace.points.push_back(p);
+
+			p.x = freeSpaceEndPoints[i].x;
+			p.z = freeSpaceEndPoints[i].z;
+			p.y = markerHeight;
+			freeSpace.points.push_back(p);
+
+			p.x = freeSpaceEndPoints[i+1].x;
+			p.z = freeSpaceEndPoints[i+1].z;
+			p.y = markerHeight;
+			freeSpace.points.push_back(p);
+
+		}
+
 		pubFreeSpaceMarker.publish(freeSpace);
+		freeSpaceEndPoints.clear();
+
+		filteredDirections.header = h;
+		filteredDirections.ns = "drive_directions_filtered";
+		filteredDirections.id = 0;
+		filteredDirections.type = visualization_msgs::Marker::LINE_LIST;
+		filteredDirections.action = visualization_msgs::Marker::ADD;
+		filteredDirections.scale.x = 0.1;
+		filteredDirections.scale.y = 0.1;
+		filteredDirections.scale.z = 1;
+
+		filteredDirections.color.b = 205;
+		filteredDirections.color.a = 1;
+		filteredDirections.lifetime = ros::Duration();
+
+		/*
+		for(int i=0; i<consistentDirs.size(); ++i){
+
+			for(int j=0; j<passedDirs.size(); ++j){
+
+				if(fabs(consistentDirs[i] - passedDirs[j]) <=10){
+					p.x = 0;
+					p.z = 0;
+					p.y = markerHeight;
+
+					filteredDirections.points.push_back(p);
+					cout<<"pub"<<i<<"-";
+					// to direction
+					p.x = 2 * cos(estimateDir->toRadian(consistentDirs[i])) ;
+					p.y = markerHeight;
+					p.z = 2 * sin(estimateDir->toRadian(consistentDirs[i])) ;
+
+					filteredDirections.points.push_back(p);
+					break;
+				}
+			}
+		}*/
+
+		//if(filteredDirections.points.size()==0){
+			for(int i=0; i<consistentDirs.size(); ++i){
+					p.x = 0;
+					p.z = 0;
+					p.y = markerHeight;
+
+					filteredDirections.points.push_back(p);
+					cout<<"pub"<<i<<"-";
+					// to direction
+					p.x = 2 * cos(estimateDir->toRadian(consistentDirs[i])) ;
+					p.y = markerHeight;
+					p.z = 2 * sin(estimateDir->toRadian(consistentDirs[i])) ;
+
+					filteredDirections.points.push_back(p);
+			}
+		//}
+		cerr<<endl;
+		pubDriveDirectionGlobalFiltered.publish(filteredDirections);
+
 }
 
 
@@ -1228,7 +1612,8 @@ void computeDirectionsFromDisparity( const ImageConstPtr& l_image_msg,
 		locs.clear();
 	    gapEndPoints.clear();
 	    
-		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints);	
+		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints,true);
+		estimateDir->getFreeSpaceEndPoints(freeSpaceEndPoints);
 		point_cloud_ground->clear();
 	
 		estimateDir->getGridAsPointCloud(point_cloud_grid, false);		// with free space rendered
@@ -1245,7 +1630,41 @@ void computeDirectionsFromDisparity( const ImageConstPtr& l_image_msg,
 		pub_ground_points.publish(point_cloud_ground);
 		pub_obstacle_points.publish(point_cloud_obstacle);
 		
-		publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, false  , true);
+	//	publishDirections(dirs, locs, gapEndPoints, l_info_msg->header, true, false  , true);
+
+
+		/*smoothing the directions being generated by checking and rejecting inconsistent directinos and also by averaging them*/
+
+		if(numOfFramesBuffered<numOfFramesForConsistencyCheck){
+
+		    directionsBuffer.push_back(dirs);
+			numOfFramesBuffered++;
+
+		}
+		else{
+			float angleTol=10.0;
+			n->getParam("frames_for_direction_consistency_check", numOfFramesForConsistencyCheck);
+			n->getParam("angle_tol_for_consistency_filter", angleTol);
+
+			getConsistentDirections(directionsBuffer,consistentDirs,numOfFramesForConsistencyCheck,angleTol);
+
+			//note that getConsistentDirections() it self clears the consistenDirs vector if there is any new consistent directions
+			//else it doesnot do any thing hence previous consisten direction is published
+
+			publishDirections(dirs, consistentDirs, locs, gapEndPoints, l_info_msg->header, true, false);
+
+			// queuing action.. remove the first and push the new one
+			int i=0;
+			for(i=1; i<directionsBuffer.size(); ++i){
+
+				(directionsBuffer[i-1]).clear();
+				(directionsBuffer[i-1]) = (directionsBuffer[i]);
+			}
+
+			(directionsBuffer[i-1]).clear();
+			directionsBuffer[i-1] = dirs;
+		}
+
 
 	}//if disparity
 
@@ -1307,7 +1726,12 @@ void computeDirectionsFromPointCloud(const sensor_msgs::PointCloud2ConstPtr &clo
 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_grid(new pcl::PointCloud<pcl::PointXYZRGB>);				
 		point_cloud_grid->header = point_cloud->header;
 		point_cloud_grid->width = 1;	
-				
+
+		//for full point cloud from the base excluding obstacles
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_full(new pcl::PointCloud<pcl::PointXYZRGB>);
+		point_cloud_full->header = point_cloud->header;
+		point_cloud_full->width = 1;
+
 		cv::Point3f p;
 		// make points for road to be fit to be fit..
 		for(size_t i = 0; i<point_cloud_conv->size(); ++i){
@@ -1326,9 +1750,19 @@ void computeDirectionsFromPointCloud(const sensor_msgs::PointCloud2ConstPtr &clo
 				
 				point_cloud->push_back(point_cloud_conv->points[i]);
 			}
-					
+
+			/*just for some result gathering purpose--has to be removed
+			if(p.z > minZ && p.z<=estimateDir->getGridSize()*0.1 && p.z!= image_geometry::StereoCameraModel::MISSING_Z && !std::isinf(p.z) && !isnan(p.z)){
+
+				point_cloud_full->push_back(point_cloud_conv->points[i]);
+			}*/
 		}
 		
+
+		//adjust the camera pitch..
+		Eigen::Affine3f rot;
+		pcl::getTransformation(0,0,0,estimateDir->toRadian(-2.2),0,0,rot);
+		pcl::transformPointCloud (*point_cloud, *point_cloud, rot);
 		estimateDir->setPointCloud(point_cloud);
 		
 		//fit plane only when obstacle segmentation method = 1 i.e. road plane fitting based		
@@ -1339,7 +1773,26 @@ void computeDirectionsFromPointCloud(const sensor_msgs::PointCloud2ConstPtr &clo
 		locs.clear();
 	    gapEndPoints.clear();
 	    
-		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints);	
+		estimateDir->getDriveDirectionsBasedOnGapWidth(dirs, locs, gapEndPoints);
+
+		// filter inappropriate directions
+		vector<float> filteredDirs;
+		filterInappropriateDirections(dirs,gapEndPoints,filteredDirs);
+
+		//smooth direction
+
+		// if curr empty then use previous. if previous is also empty then we dont have any direction
+		if(filteredDirs.empty()){
+			//filteredDirs = prevDirs;
+		}
+
+		// if curr or prev both not empty smooth direction
+		else if(!prevDirs.empty()){
+
+			smoothDirections(prevDirs, filteredDirs, gapEndPoints);
+		}
+
+		estimateDir->getFreeSpaceEndPoints(freeSpaceEndPoints);
 		point_cloud_ground->clear();
 	
 		estimateDir->getGridAsPointCloud(point_cloud_grid, false);		// with free space rendered
@@ -1349,15 +1802,19 @@ void computeDirectionsFromPointCloud(const sensor_msgs::PointCloud2ConstPtr &clo
 		estimateDir->getGroundPoints(point_cloud_ground);
 		estimateDir->getObstaclePoints(point_cloud_obstacle);	
 		
-		pub_point_cloud.publish(point_cloud);
+		pub_point_cloud.publish(point_cloud_full);	//_full has tob removed...only point_cloud
 		pub_grid_view.publish(point_cloud_grid);
 		pub_ground_points.publish(point_cloud_ground);
 		pub_obstacle_points.publish(point_cloud_obstacle);
+
+		publishDirections(filteredDirs,filteredDirs, locs, gapEndPoints, cloud->header, true, false);
 		
-		publishDirections(dirs, locs, gapEndPoints, cloud->header, true, false, true);
-		
+		prevDirs.clear();
+		prevDirs = filteredDirs;
 	}
 }
+
+
 
 
 int main(int argc, char **argv){		
@@ -1376,19 +1833,22 @@ int main(int argc, char **argv){
 	n->setParam("max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);
 	n->setParam("min_Z", 1.5);
 	n->setParam("max_Y", -1.0);
-	n->setParam("marker_z_position_offset",-0.1);
+	n->setParam("marker_z_position_offset",0);
 	n->setParam("input_mode", 1);	//0-means use disparity, 1- use point cloud
+	n->setParam("frames_for_direction_consistency_check", 3);
+	n->setParam("angle_tol_for_consistency_filter", 10.0);
 	
-	
-	printf("%32s - %f\n","marker_z_position_offset",-0.1);
-	printf("%32s - %f\n","max_Z_for_plane_fitting", 10.0);			
+	printf("%32s - %f\n","marker_z_position_offset",0.0);
+	printf("%32s - %f\n","max_Z_for_plane_fitting", 6.0);
 	printf("%32s - %f\n","max_X_for_plane_fitting", 1.0);		
 	printf("%32s - %f\n","max_Y_for_plane_fitting", estimateDir->getCameraHeightFromRoad()-0.3);			
 	printf("%32s - %f\n","min_Z", 1.5);		
 	printf("%32s - %f\n","max_Y", -1.0);
 	printf("%32s - %i\n","input_method", 1);	
+	printf("%32s - %i\n","frames_for_direction_consistency_check", 3);
+	printf("%32s - %f\n","angle_tol_for_consistency_filter", 10.0);
 
-	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/stereo_camera/left/image_rect", 10);
+	message_filters::Subscriber<sensor_msgs::Image> sub_l_img(*n, "/stereo_camera/left/image_rectt", 10);
 	message_filters::Subscriber<DisparityImage> sub_disp_img(*n, "/stereo_camera/disparity", 10);
 	message_filters::Subscriber<sensor_msgs::CameraInfo> sub_l_info(*n, "/stereo_camera/left/camera_info_throttle", 10);
 	message_filters::Subscriber<CameraInfo> sub_r_info(*n, "/stereo_camera/right/camera_info_throttle", 10);
@@ -1398,7 +1858,7 @@ int main(int argc, char **argv){
 	Synchronizer<myApprxSyncPolicy> sync(myApprxSyncPolicy(10), sub_l_img, sub_l_info,sub_r_info, sub_disp_img);
 	sync.registerCallback(boost::bind(computeDirectionsFromDisparity, _1, _2,_3,_4));
 
-	ros::Subscriber sub_point_cloud = n->subscribe("/stereo_camera/points2", 10, computeDirectionsFromPointCloud);
+	ros::Subscriber sub_point_cloud = n->subscribe("/stereo_camera/points2/", 10, computeDirectionsFromPointCloud);
 
     //sub = nh.subscribe("/camera/points2", 100, pointCloudFromDisparity);  
 	pub_point_cloud = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("incoming_point_cloud", 1);
@@ -1406,7 +1866,9 @@ int main(int argc, char **argv){
 	pub_ground_points = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("ground_points", 1);
 	pub_obstacle_points = n->advertise<pcl::PointCloud<pcl::PointXYZRGB> >("obstacle_points", 1);
 		
-    pubDriveDirectionGlobal = n->advertise<visualization_msgs::Marker>("drive_directions",1);	
+    pubDriveDirectionGlobal = n->advertise<visualization_msgs::Marker>("drive_directions",1);
+    pubDriveDirectionGlobalFiltered = n->advertise<visualization_msgs::Marker>("filtered_drive_directions",1);
+
     pubGapMarkersGlobal = n->advertise<visualization_msgs::Marker>("gap_marks",1);	
     pubDriveDirectionAsPoses = n->advertise<geometry_msgs::PoseArray>("directions_as_poses",1);    
     pubFreeSpaceMarker = n->advertise<visualization_msgs::Marker>("free_space_marker", 1);
@@ -1418,6 +1880,47 @@ int main(int argc, char **argv){
 }
 
 
+
+/*
+
+//buffer consistent directions for extrapolation
+			if(consistentDirCnt<2){
+				consistentDirBuffer.push_back(consistentDirs);
+				consistentDirCnt++;
+			}
+			else{
+
+
+				float deltaTheta;
+
+				//look for matching dirs so that we can do linear extrapolation
+				for(int i=0; i<consistentDirBuffer[0].size(); ++i){
+					for(int j=0; j<consistentDirBuffer[1].size(); ++j){
+
+						if( fabs((consistentDirBuffer[0])[i] - (consistentDirBuffer[1])[j]) <= 10.0 ){
+
+							deltaTheta = (consistentDirBuffer[0])[i] - (consistentDirBuffer[1])[j];
+							if(!dirChanged)
+								consistentDirs[i] +=deltaTheta;
+							break;
+						}
+					}
+				}
+
+				//queing for consistentDirectionBuffer
+				consistentDirBuffer[0].clear();
+				consistentDirBuffer[0] = consistentDirBuffer[1];
+				consistentDirBuffer[1].clear();
+				consistentDirBuffer[1] = consistentDirs;
+
+			}
+
+
+
+
+
+
+*/
 
 
 
