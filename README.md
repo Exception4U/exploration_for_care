@@ -1,5 +1,5 @@
-# exploration_for_care
-## EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
+# EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
+
 ### Description - 
 This node estimates all possible safe driveable directions for a robot given a disparity image. The safety is governed by the availability of enough gap width which can be set dynamically.
 
