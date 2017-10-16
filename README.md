@@ -1,11 +1,10 @@
 # exploration_for_care
-EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
-	---------------------------------------------------
-	
-	Description - This node estimates all possible safe driveable directions for
- a robot given a disparity image. The safety is governed by the availability of enough 
-gap width which can be set dynamically (see ExploreDirectionEstimator::setupParameters() ).
-				  
+## EXPLORE DIRECTION ESTIMATOR for ROBOTIC EXPLORATION
+### Description - 
+This node estimates all possible safe driveable directions for a robot given a disparity image. The safety is governed by the availability of enough gap width which can be set dynamically 
+'''
+see ExploreDirectionEstimator::setupParameters() .
+'''				  
   Important features:
 	  - Road plane segmentation based on RANSAC (pcl plane fitting used) and hence obstacle segmentation 
 	  - genrates possible driveable directions for the vehicle based on available gap
@@ -27,12 +26,3 @@ gap width which can be set dynamically (see ExploreDirectionEstimator::setupPara
   	  - /explore/direction_as_poses (drive directions as PoseArray msg - position - gapcenterpos, orientation - direction)
 				  	  
 				  	  
-Note - More info on parameters to be here soon.... 
-
-To Do - publish a range of directions for ever gap so that the PLANNER node can decide upon which is most suitable	
-	  - Write callback for param change
-	  - when there is no plane fo fitting, keep the previous values of parameters
-	  - parameter for overriding marker height 
-	  - provide parameter for angle rejection
-
-
